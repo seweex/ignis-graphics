@@ -1,5 +1,7 @@
 cmake_minimum_required (VERSION 3.18...4.2)
 
+# CONFIGURE
+
 set (IGNIS_VERSION_MAJOR 0)
 set (IGNIS_VERSION_MINOR 0)
 set (IGNIS_VERSION_PATCH 1)
@@ -22,6 +24,21 @@ target_include_directories (ignis
 
 target_compile_definitions (ignis
     INTERFACE cxx_std_20)
+
+# DEPENDENCIES
+
+find_package (Boost REQUIRED COMPONENTS container unordered)
+find_package (Vulkan CONFIG REQUIRED)
+find_package (glfw CONFIG REQUIRED)
+
+target_link_libraries (ignis
+    INTERFACE
+        Boost::container
+        Boost::unordered
+        Vulkan::Vulkan
+        glfw::glfw)
+
+# INSTALL
 
 include (GNUInstallDirs)
 include (CMakePackageConfigHelpers)
