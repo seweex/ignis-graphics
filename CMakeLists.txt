@@ -22,21 +22,21 @@ target_include_directories (ignis
         $<INSTALL_INTERFACE:include>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 
-target_compile_definitions (ignis
+target_compile_features (ignis
     INTERFACE cxx_std_20)
 
 # DEPENDENCIES
 
 find_package (Boost REQUIRED COMPONENTS container unordered)
-find_package (Vulkan CONFIG REQUIRED)
-find_package (glfw CONFIG REQUIRED)
+find_package (Vulkan REQUIRED)
+find_package (glfw3 CONFIG REQUIRED)
 
 target_link_libraries (ignis
     INTERFACE
         Boost::container
         Boost::unordered
         Vulkan::Vulkan
-        glfw::glfw)
+        glfw)
 
 # INSTALL
 
@@ -64,3 +64,8 @@ write_basic_package_version_file (
 install (
     FILES ${CMAKE_CURRENT_BINARY_DIR}/ignis-config-version.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ignis)
+
+# IDE ANALYZING
+
+add_executable (ignis-test include/ignis/main.cpp)
+target_link_libraries (ignis-test PUBLIC ignis)
