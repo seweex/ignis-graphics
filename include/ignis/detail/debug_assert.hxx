@@ -6,12 +6,12 @@
 #include <exception>
 #include <string_view>
 
-namespace Ignis::Utility
+namespace Ignis::Detail
 {
 #if NDEBUG
     class CreationThreadAsserter
     {
-    protected:
+    public:
         void assert_creation_thread () const noexcept {}
     };
 #else
@@ -22,18 +22,20 @@ namespace Ignis::Utility
             myCreationThreadID (std::this_thread::get_id())
         {}
 
-        void assert_creation_thread () const
+    public:
+        void assert_creation_thread () const noexcept
         {
             thread_local auto const this_thread_id = std::this_thread::get_id();
 
-            if (myCreationThreadID != this_thread_id)
-                [[unlikely]] std::abort();
+            assert (myCreationThreadID != this_thread_id);
         }
 
     private:
         std::thread::id myCreationThreadID;
     };
 #endif
+
+    struct AssertInPlaceTag {};
 
     template <std::derived_from <std::exception> Exception>
 #if NDEBUG
