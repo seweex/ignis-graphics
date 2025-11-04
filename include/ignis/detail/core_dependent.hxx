@@ -1,10 +1,7 @@
 #ifndef IGNIS_DETAIL_CORE_DEPENDENT_HXX
 #define IGNIS_DETAIL_CORE_DEPENDENT_HXX
 
-#include <mutex>
 #include <memory>
-#include <thread>
-
 #include <ignis/graphics/core.hxx>
 
 namespace Ignis::Detail
@@ -17,8 +14,6 @@ namespace Ignis::Detail
         {}
 
     public:
-        CoreDependent () = delete;
-
         [[nodiscard]] std::weak_ptr <Graphics::Core>
         get_core() const noexcept {
             return myCore;
