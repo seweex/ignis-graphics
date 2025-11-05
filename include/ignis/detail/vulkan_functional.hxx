@@ -1,3 +1,5 @@
+#ifndef IGNIS_DETAIL_VULKAN_FUNCTIONAL_HXX
+#define IGNIS_DETAIL_VULKAN_FUNCTIONAL_HXX
 
 #include <concepts>
 #include <type_traits>
@@ -5,7 +7,7 @@
 
 #include <vulkan/vulkan_raii.hpp>
 
-namespace Kygo::Detail
+namespace Ignis::Detail
 {
 	template <class Ty>
 	class VulkanHandleTraits final
@@ -69,10 +71,11 @@ namespace Kygo::Detail
 		template <class LeftHandle, class RightHandle>
 		[[nodiscard]] bool operator() (LeftHandle const& left, RightHandle const& right) const noexcept
 		{
-			using Traits = VulkanHandleTraits <Handle>;
+			using LeftTraits = VulkanHandleTraits <LeftHandle>;
+			using RightTraits = VulkanHandleTraits <RightHandle>;
 
-			auto const leftHandle = Traits::get_handle(handle);
-			auto const rightHandle = Traits::get_handle(handle);
+			auto const leftHandle = LeftTraits::get_handle (left);
+			auto const rightHandle = RightTraits::get_handle (right);
 
 			return leftHandle == rightHandle;
 		}

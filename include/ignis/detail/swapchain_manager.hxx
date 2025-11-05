@@ -24,21 +24,6 @@ namespace Ignis::Detail
         public virtual CoreDependent,
         public virtual SchedulerBase
     {
-    protected:
-        [[nodiscard]] uint32_t
-        assert_passthrough_frames (uint32_t const frames) const 
-        {
-            auto& physicalDevice = CoreDependent::get_physical_device();
-            auto const surface = CoreDependent::get_surface();
-
-            if (auto const capabilities = physicalDevice.getSurfaceCapabilitiesKHR (surface);
-                frames < capabilities.minImageCount || frames > capabilities.maxImageCount)
-                throw std::runtime_error("Unsupported frames number");
-            
-            return frames;
-        }
-
-    private:
         [[nodiscard]] static vk::PresentModeKHR
         pick_present_mode (
             vk::raii::PhysicalDevice const& physicalDevice,

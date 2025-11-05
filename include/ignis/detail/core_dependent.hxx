@@ -24,6 +24,17 @@ namespace Ignis::Detail
             myCore->assert_creation_thread();
         }
 
+        [[nodiscard]] uint32_t
+        assert_passthrough_frames_number (uint32_t const frames) const
+        {
+            if (auto const capabilities = myCore->myPhysicalDevice.getSurfaceCapabilitiesKHR (myCore->mySurface);
+                frames < capabilities.minImageCount || frames > capabilities.maxImageCount)
+                [[unlikely]]
+                    throw std::runtime_error("Unsupported frames number");
+
+            return frames;
+        }
+
         [[nodiscard]] vk::raii::PhysicalDevice const&
         get_physical_device() const noexcept {
             return myCore->myPhysicalDevice;
@@ -42,6 +53,11 @@ namespace Ignis::Detail
         [[nodiscard]] vk::SurfaceKHR
         get_surface () const noexcept {
             return *myCore->mySurface;
+        }
+
+        [[nodiscard]] vk::raii::detail::DeviceDispatcher const&
+        get_dispatcher () const noexcept {
+            return *myCore->myDevice.getDispatcher();
         }
 
     private:
