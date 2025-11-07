@@ -6,6 +6,7 @@
 #include <mutex>
 
 #include <boost/container/flat_set.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include <vulkan/vulkan_raii.hpp>
@@ -15,6 +16,7 @@
 
 #include <ignis/detail/core_dependent.hxx>
 #include <ignis/detail/resource_allocator.hxx>
+#include <ignis/detail/scheduler.hxx>
 
 namespace Ignis::Detail
 {
@@ -98,29 +100,68 @@ namespace Ignis::Graphics
     template <BufferType Type, BufferUsage Usage>
     class Buffer final
     {
-        Buffer (vk::DeviceMemory const memory, vk::Buffer const buffer)
+        Buffer (vk::DeviceMemory const memory, vk::Buffer const buffer, size_t const size)
         noexcept :
             myMemory (memory),
-            myBuffer (buffer)
+            myBuffer (buffer),
+            mySize (size)
         {}
 
     public:
+        Buffer (Buffer const&) noexcept = default;
+        Buffer& operator=(Buffer const&) noexcept = default;
+
+        Buffer (Buffer&& other) noexcept :
+            myMemory (std::exchange (other.myMemory, VK_NULL_HANDLE)),
+            myBuffer (std::exchange (other.myBuffer, VK_NULL_HANDLE)),
+            mySize (std::exchange (other.mySize, 0))
+        {}
+
+        Buffer& operator=(Buffer&& other) noexcept
+        {
+            if (this == &other) [[unlikely]]
+                return *this;
+
+            myMemory = std::exchange (other.myMemory, VK_NULL_HANDLE);
+            myBuffer = std::exchange (other.myBuffer, VK_NULL_HANDLE);
+            mySize = std::exchange (other.mySize, 0);
+
+            return *this;
+        }
+
         template <bool InternalSync>
         friend class BufferFactory;
 
         template <bool InternalSync>
-        friend class DataTransferDispatcher;
+        friend class TransferManager;
+
+        [[nodiscard]] bool
+        is_valid () const noexcept {
+            return
+                myMemory != VK_NULL_HANDLE &&
+                myBuffer != VK_NULL_HANDLE &&
+                mySize > 0;
+        }
+
+        [[nodiscard]] size_t
+        get_size() const noexcept {
+            assert (is_valid ());
+            return mySize;
+        }
 
     private:
         vk::DeviceMemory myMemory;
         vk::Buffer myBuffer;
+        size_t mySize;
     };
 
     template <bool InternalSync>
     class BufferFactory :
         public virtual Detail::CoreDependent,
-        public virtual Detail::ResourceAllocator
+        public virtual Detail::ResourceAllocator <InternalSync>
     {
+        using ResourceAllocator = Detail::ResourceAllocator <InternalSync>;
+
         template <BufferType Type>
         [[nodiscard]] static consteval Detail::MemoryType choose_memory_type () noexcept
         {
@@ -184,7 +225,8 @@ namespace Ignis::Graphics
         }
 
         template <BufferUsage Usage>
-        [[nodiscard]] vk::raii::Buffer create_buffer (
+        [[nodiscard]] std::pair <vk::raii::Buffer, vk::MemoryRequirements>
+        create_buffer_and_memory_requirements (
             size_t const size,
             bool const allowTransferRead,
             bool const allowTransferWrite)
@@ -203,7 +245,14 @@ namespace Ignis::Graphics
                 families.sequence().data()
             };
 
-            return { device, createInfo };
+            auto const requirements = device.getBufferMemoryRequirements
+                ({ &createInfo }).memoryRequirements;
+
+            return {
+                std::piecewise_construct,
+                std::forward_as_tuple (device, createInfo),
+                std::forward_as_tuple (requirements)
+            };
         }
 
     protected:
@@ -226,6 +275,7 @@ namespace Ignis::Graphics
                 Usage == BufferUsage::storage))
         [[nodiscard]] Buffer <Type, Usage> make_buffer (
             size_t const size,
+            PreferMemory const memoryPreference,
             bool const allowTransferRead,
             bool const allowTransferWrite)
         {
@@ -234,14 +284,16 @@ namespace Ignis::Graphics
             if constexpr (Type == BufferType::immutable)
                 assert (!allowTransferWrite);
 
-            auto constexpr memoryType = choose_memory_type <Type> ();
+            auto [buffer, memoryRequirements] = create_buffer_and_memory_requirements
+                <Usage> (size, allowTransferRead, allowTransferWrite);
 
-            auto memory = ResourceAllocator::allocate <memoryType> (size);
-            auto buffer = create_buffer <Usage> (size, allowTransferRead, allowTransferWrite);
+            auto constexpr memoryType = choose_memory_type <Type> ();
+            auto memory = ResourceAllocator::template
+                allocate <memoryType> (memoryRequirements, memoryPreference);
 
             auto const [memoryHandle, bufferHandle] = myStorage.emplace (std::move (memory), std::move (buffer));
 
-            return { memoryHandle, bufferHandle };
+            return { memoryHandle, bufferHandle, size };
         }
 
         template <BufferType Type, BufferUsage Usage>

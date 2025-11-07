@@ -2,6 +2,7 @@
 #define IGNIS_DETAIL_SCHEDULER_HXX
 
 #include <boost/container/small_vector.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
 #include <ignis/detail/core_dependent.hxx>
@@ -11,6 +12,9 @@ namespace Ignis::Detail
 {
     template <bool InternalSync>
     class PendingExecutionBuffers;
+
+    template <bool InternalSync>
+    class CommandPools;
 
     template <>
     class PendingExecutionBuffers <true>
@@ -52,8 +56,10 @@ namespace Ignis::Detail
     private:
         std::mutex myPendingMutex;
 
-        std::vector <vk::raii::CommandBuffer> myPendingBuffers;
-        std::vector <vk::CommandBuffer> myPendingHandles;
+        struct alignas(64) {
+            std::vector <vk::raii::CommandBuffer> myPendingBuffers;
+            std::vector <vk::CommandBuffer> myPendingHandles;
+        };
 
         std::vector <vk::raii::CommandBuffer> myExecutingBuffers;
         std::vector <vk::CommandBuffer> myExecutingHandles;
@@ -86,6 +92,95 @@ namespace Ignis::Detail
     private:
         std::vector <vk::raii::CommandBuffer> myBuffers;
         std::vector <vk::CommandBuffer> myHandles;
+    };
+
+    template <>
+    class CommandPools <true>
+    {
+        static thread_local auto const inline this_thread_id = std::this_thread::get_id();
+
+        [[nodiscard]] std::optional <vk::CommandPool>
+        find_pool () const noexcept
+        {
+            std::shared_lock lock { myMutex };
+
+            if (auto const iter = myPools.find (this_thread_id);
+                iter != myPools.end()) [[likely]]
+                return iter->second;
+            else
+                return std::nullopt;
+        }
+
+        [[nodiscard]] vk::CommandPool
+        emplace_pool ()
+        {
+            vk::CommandPoolCreateInfo const createInfo
+                { vk::CommandPoolCreateFlagBits::eTransient, myFamily };
+
+            vk::raii::CommandPool pool { myDevice, createInfo };
+
+            std::unique_lock lock { myMutex };
+            return myPools.emplace (this_thread_id, std::move (pool)).first->second;
+        }
+
+    public:
+        CommandPools (vk::raii::Device& device, uint32_t const family)
+        noexcept :
+            myDevice (device),
+            myFamily (family)
+        {}
+
+        CommandPools (CommandPools &&) = delete;
+        CommandPools (CommandPools const&) = delete;
+
+        CommandPools& operator=(CommandPools &&) = delete;
+        CommandPools& operator=(CommandPools const&) = delete;
+
+        [[nodiscard]] vk::CommandPool
+        acquire_pool ()
+        {
+            if (auto const pool = find_pool();
+                pool.has_value()) [[likely]]
+                return *pool;
+            else
+                return emplace_pool ();
+        }
+
+    private:
+        vk::raii::Device& myDevice;
+        uint32_t myFamily;
+
+        std::shared_mutex mutable myMutex;
+
+        alignas (64) boost::unordered::unordered_flat_map
+            <std::thread::id, vk::raii::CommandPool, std::hash <std::thread::id>>
+        myPools;
+    };
+
+    template <>
+    class CommandPools <false>
+    {
+        [[nodiscard]] static vk::raii::CommandPool
+        make_command_pool (vk::raii::Device& device, uint32_t const family)
+        {
+            vk::CommandPoolCreateInfo const createInfo
+                { vk::CommandPoolCreateFlagBits::eTransient, family };
+
+            return { device, createInfo };
+        }
+
+    public:
+        CommandPools (vk::raii::Device& device, uint32_t const family) :
+            myPool (make_command_pool (device, family))
+        {}
+
+        [[nodiscard]] vk::CommandPool
+        acquire_pool () noexcept {
+           return myPool;
+        }
+
+    private:
+        vk::raii::CommandPool myPool;
     };
 
     class SchedulerBase :
@@ -126,6 +221,11 @@ namespace Ignis::Detail
             return fences;
         }
 
+    public:
+        SchedulerBase () noexcept {
+            std::terminate();
+        }
+
     protected:
         explicit SchedulerBase (uint32_t const frames)
         :
@@ -136,6 +236,18 @@ namespace Ignis::Detail
             myInFlightFences (make_fences (frames)),
             myGraphicsWaitsTransfer (false)
         {}
+
+        [[nodiscard]] vk::raii::CommandBuffer
+        make_command_buffer (vk::CommandPool const pool) const
+        {
+            auto const& device = CoreDependent::get_device();
+
+            vk::CommandBufferAllocateInfo const allocateInfo
+                { pool, vk::CommandBufferLevel::ePrimary, 1 };
+
+            vk::raii::CommandBuffers buffers { device, allocateInfo };
+            return std::move (buffers.front());
+        }
 
         [[nodiscard]] vk::Semaphore
         get_image_available_semaphore (uint32_t const frame) {
@@ -181,19 +293,17 @@ namespace Ignis::Detail
             return shouldWait && flagTaken;
         }
 
-    public:
-
     private:
-        boost::container::small_vector <vk::raii::Semaphore, images_hint>
+        alignas (64) boost::container::small_vector <vk::raii::Semaphore, images_hint>
         myImageAvailableSemaphores;
 
-        boost::container::small_vector <vk::raii::Semaphore, images_hint>
+        alignas (64) boost::container::small_vector <vk::raii::Semaphore, images_hint>
         myRenderCompletedSemaphores;
 
-        boost::container::small_vector <vk::raii::Semaphore, images_hint>
+        alignas (64) boost::container::small_vector <vk::raii::Semaphore, images_hint>
         myTransferCompletedSemaphores;
 
-        boost::container::small_vector <vk::raii::Fence, images_hint>
+        alignas (64) boost::container::small_vector <vk::raii::Fence, images_hint>
         myInFlightFences;
 
         std::atomic_bool myGraphicsWaitsTransfer;
@@ -206,14 +316,22 @@ namespace Ignis::Detail
     protected:
         explicit GraphicsScheduler (uint32_t const frames)
         :
+            SchedulerBase (frames),
+
             myQueue (CoreDependent::get_device().getQueue(
                 CoreDependent::get_indices().families.graphics,
                 CoreDependent::get_indices().queues.graphics)),
 
+            myPools (CoreDependent::get_device(), CoreDependent::get_indices().families.graphics),
             myFrameCommands (frames)
         {}
 
-    public:
+        [[nodiscard]] vk::raii::CommandBuffer
+        make_graphics_command_buffers () {
+            auto const pool = myPools.acquire_pool();
+            return SchedulerBase::make_command_buffer (pool);
+        }
+
         void postpone_graphics_commands (
             vk::raii::CommandBuffer&& commands, uint32_t const frame)
         {
@@ -261,8 +379,9 @@ namespace Ignis::Detail
     private:
         vk::raii::Queue myQueue;
 
-        boost::container::small_vector
-            <PendingExecutionBuffers <InternalSync>, SchedulerBase::images_hint>
+        CommandPools <InternalSync> myPools;
+
+        boost::container::small_vector <PendingExecutionBuffers <InternalSync>, SchedulerBase::images_hint>
         myFrameCommands;
     };
 
@@ -271,13 +390,21 @@ namespace Ignis::Detail
         public virtual SchedulerBase
     {
     protected:
-        TransferScheduler () :
+        TransferScheduler ()
+        :
             myQueue (CoreDependent::get_device().getQueue(
                 CoreDependent::get_indices().families.transfer,
-                CoreDependent::get_indices().queues.transfer))
+                CoreDependent::get_indices().queues.transfer)),
+
+            myPools (CoreDependent::get_device(), CoreDependent::get_indices().families.transfer)
         {}
 
-    public:
+        [[nodiscard]] vk::raii::CommandBuffer
+        make_transfer_command_buffers () {
+            auto const pool = myPools.acquire_pool();
+            return SchedulerBase::make_command_buffer (pool);
+        }
+
         void postpone_transfer_commands (vk::raii::CommandBuffer&& commands) {
             myCommands.postpone_commands (std::move (commands));
         }
@@ -307,6 +434,8 @@ namespace Ignis::Detail
 
     private:
         vk::raii::Queue myQueue;
+
+        CommandPools <InternalSync> myPools;
         PendingExecutionBuffers <InternalSync> myCommands;
     };
 
@@ -356,9 +485,7 @@ namespace Ignis::Detail
 
     protected:
         explicit Scheduler (uint32_t const frames) :
-            GraphicsScheduler (frames),
-            TransferScheduler (),
-            PresentScheduler ()
+            GraphicsScheduler (frames)
         {}
     };
 }

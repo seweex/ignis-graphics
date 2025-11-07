@@ -22,7 +22,7 @@ namespace Ignis::Detail
 				{ handle.release() } -> std::same_as <typename Ty::CppType>;
 			}>;
 
-		[[nodiscard]] static auto const&
+		[[nodiscard]] static auto
 		get_handle (Ty const& handle) noexcept
 		{
 			if constexpr (IsRaii::value)
@@ -31,7 +31,7 @@ namespace Ignis::Detail
 				return handle;
 		}
 
-		[[nodiscard]] static auto const&
+		[[nodiscard]] static auto
 		get_native (Ty const& handle) noexcept
 		{
 			if constexpr (IsRaii::value)
@@ -81,3 +81,5 @@ namespace Ignis::Detail
 		}
 	};
 }
+
+#endif

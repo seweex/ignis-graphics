@@ -9,6 +9,10 @@ namespace Ignis::Detail
     class CoreDependent
     {
     protected:
+        CoreDependent () noexcept {
+            std::terminate();
+        }
+
         explicit CoreDependent (std::weak_ptr <Graphics::Core> const& core) :
             myCore (core)
         {}

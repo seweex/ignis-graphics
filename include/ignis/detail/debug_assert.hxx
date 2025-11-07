@@ -27,7 +27,7 @@ namespace Ignis::Detail
         {
             thread_local auto const this_thread_id = std::this_thread::get_id();
 
-            assert (myCreationThreadID != this_thread_id);
+            assert (myCreationThreadID == this_thread_id);
         }
 
     private:
