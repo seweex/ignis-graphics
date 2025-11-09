@@ -29,13 +29,20 @@ target_compile_features (ignis
 
 find_package (Boost REQUIRED COMPONENTS container unordered)
 find_package (Vulkan REQUIRED)
+find_package (VulkanMemoryAllocator CONFIG REQUIRED)
 find_package (glfw3 CONFIG REQUIRED)
+
+set (VMA_HPP_ENABLE_INSTALL ON)
+add_subdirectory (extern/VulkanMemoryAllocator-Hpp)
 
 target_link_libraries (ignis
     INTERFACE
         Boost::container
         Boost::unordered
+        Vulkan::Headers
         Vulkan::Vulkan
+        GPUOpen::VulkanMemoryAllocator
+        VulkanMemoryAllocator-Hpp::VulkanMemoryAllocator-Hpp
         glfw)
 
 # INSTALL

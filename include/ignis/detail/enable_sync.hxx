@@ -11,6 +11,9 @@ namespace Ignis::Detail
     template <bool Enable, class Mutex>
     using EnableMutex = std::conditional_t <Enable, Mutex, MutexMock>;
 
+    template <bool Enable>
+    inline constexpr size_t SyncAlignment = Enable ? 64 : alignof (void*);
+
     template <bool Enable, template <class> class Lock, class Mutex>
     [[nodiscard]] auto lock_mutex (Mutex& mutex) noexcept (!Enable)
     {
