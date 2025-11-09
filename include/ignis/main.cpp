@@ -18,12 +18,15 @@ int main ()
 
     Graphics::BufferFactory <false> factory { core };
 
-    // (void) factory.make_buffer
-    //     <Graphics::BufferType::immutable, Graphics::BufferUsage::vertex>
-    //         (1ull * 1024 *1024 * 1024, Graphics::PreferMemory::fast_access, false, false);
-    // (void) factory.make_buffer
-    //     <Graphics::BufferType::mappable, Graphics::BufferUsage::vertex>
-    //         (3ull * 1024 *1024 * 1024, Graphics::PreferMemory::large_storage, false, false);
+    (void) factory.make_buffer
+        <Graphics::BufferType::constantly_mapped, Graphics::BufferUsage::vertex, Graphics::MemoryPlacement::host>
+            (1ull * 1024 *1024 * 1024, false, false);
+
+    (void) factory.make_buffer
+        <Graphics::BufferType::transferable, Graphics::BufferUsage::storage, Graphics::MemoryPlacement::no_matter>
+            (3ull * 1024 *1024 * 1024, false, true);
+
+    for (;;);
 
     return 0;
 }

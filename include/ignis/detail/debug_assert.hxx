@@ -38,14 +38,30 @@ namespace Ignis::Detail
     struct AssertInPlaceTag {};
 
     template <std::derived_from <std::exception> Exception>
+    [[noreturn]] void debug_throw (
+        [[maybe_unused]] std::string_view const description)
 #if NDEBUG
-    void debug_throw (std::string_view) noexcept {}
+    noexcept {}
 #else
-    [[noreturn]] void debug_throw (std::string_view const description)
-    {
-        throw Exception { description.data() };
-    }
+    { throw Exception { description.data() }; }
 #endif
+
+    template <class Enum>
+    constexpr bool is_enum_valid ([[maybe_unused]] Enum const value) noexcept
+    {
+#if NDEBUG
+        return true;
+#else
+        using Underlying = std::underlying_type_t <Enum>;
+
+        auto constexpr first = static_cast <Underlying> (Enum::first_enum_value);
+        auto constexpr last = static_cast <Underlying> (Enum::last_enum_value);
+
+        auto const numericValue = static_cast <Underlying> (value);
+
+        return numericValue >= first && numericValue <= last;
+#endif
+    }
 }
 
 #endif

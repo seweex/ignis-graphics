@@ -22,11 +22,22 @@ namespace Ignis::Detail
 				{ handle.release() } -> std::same_as <typename Ty::CppType>;
 			}>;
 
+		using IsUniqueHandle = std::bool_constant <
+			requires (Ty& handle)
+			{
+				typename Ty::element_type;
+				handle.get();
+			}>;
+
 		[[nodiscard]] static auto
 		get_handle (Ty const& handle) noexcept
 		{
 			if constexpr (IsRaii::value)
 				return static_cast <typename Ty::CppType> (handle);
+
+			else if constexpr (IsUniqueHandle::value)
+				return handle.get();
+
 			else
 				return handle;
 		}
@@ -36,6 +47,10 @@ namespace Ignis::Detail
 		{
 			if constexpr (IsRaii::value)
 				return static_cast <typename Ty::CType> (*handle);
+
+			else if constexpr (IsUniqueHandle::value)
+				return static_cast <typename Ty::element_type::CType> (handle.get());
+
 			else
 				return static_cast <typename Ty::CType> (handle);
 		}

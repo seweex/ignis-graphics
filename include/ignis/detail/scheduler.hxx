@@ -6,7 +6,7 @@
 #include <vulkan/vulkan_raii.hpp>
 
 #include <ignis/detail/core_dependent.hxx>
-#include <ignis/detail/sync_mocks.hxx>
+#include <ignis/detail/enable_sync.hxx>
 
 namespace Ignis::Detail
 {

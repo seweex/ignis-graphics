@@ -72,6 +72,8 @@ namespace Ignis::Graphics
             assert (!application.name.empty());
             assert (!engine.name.empty());
 
+            auto const version = myContext.enumerateInstanceVersion();
+
             vk::ApplicationInfo const applicationInfo
             {
                 application.name.data(),
@@ -82,7 +84,7 @@ namespace Ignis::Graphics
                 VK_MAKE_VERSION
                     (engine.versionMajor, engine.versionMinor, engine.versionPatch),
 
-                VK_API_VERSION_1_4
+                version
             };
 
             auto const extensions = GLFWDependent::get_extensions();

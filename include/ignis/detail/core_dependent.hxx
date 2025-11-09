@@ -4,6 +4,8 @@
 #include <memory>
 #include <ignis/graphics/core.hxx>
 
+#include "ignis/graphics/buffer.hxx"
+
 namespace Ignis::Detail
 {
     class CoreDependent
@@ -39,6 +41,11 @@ namespace Ignis::Detail
             return frames;
         }
 
+        [[nodiscard]] vk::raii::Instance const&
+        get_instance() const noexcept {
+            return myCore->myInstance;
+        }
+
         [[nodiscard]] vk::raii::PhysicalDevice const&
         get_physical_device() const noexcept {
             return myCore->myPhysicalDevice;
@@ -60,8 +67,23 @@ namespace Ignis::Detail
         }
 
         [[nodiscard]] vk::raii::detail::DeviceDispatcher const&
-        get_dispatcher () const noexcept {
+        get_device_dispatcher () const {
             return *myCore->myDevice.getDispatcher();
+        }
+
+        [[nodiscard]] vk::raii::detail::InstanceDispatcher const&
+        get_instance_dispatcher () const {
+            return *myCore->myInstance.getDispatcher();
+        }
+
+        [[nodiscard]] vk::raii::detail::ContextDispatcher const&
+        get_context_dispatcher () const {
+            return *myCore->myContext.getDispatcher();
+        }
+
+        [[nodiscard]] uint32_t
+        get_vulkan_version () const {
+            return myCore->myContext.enumerateInstanceVersion();
         }
 
     private:

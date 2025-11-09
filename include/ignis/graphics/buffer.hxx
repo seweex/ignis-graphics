@@ -10,97 +10,46 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include <vulkan/vulkan_raii.hpp>
+#include <ignis/detail/include_vulkan_allocator.hxx>
 
-#include <ignis/detail/sync_mocks.hxx>
+#include <ignis/detail/enable_sync.hxx>
 #include <ignis/detail/vulkan_functional.hxx>
 
 #include <ignis/detail/core_dependent.hxx>
-#include <ignis/detail/resource_allocator.hxx>
+#include <ignis/detail/resource_memory.hxx>
 #include <ignis/detail/scheduler.hxx>
-
-namespace Ignis::Detail
-{
-    template <bool InternalSync>
-    class BufferHandleStorage;
-
-    template <>
-    class BufferHandleStorage <true> final
-    {
-    public:
-        [[nodiscard]] std::pair <vk::DeviceMemory, vk::Buffer>
-        emplace (vk::raii::DeviceMemory&& memory, vk::raii::Buffer&& buffer)
-        {
-            std::lock_guard lock { myMutex };
-
-            myMemory.reserve (myMemory.size() + 1);
-            myBuffers.reserve (myBuffers.size() + 1);
-
-            vk::DeviceMemory const memoryHandle = *myMemory.emplace (std::move (memory)).first;
-            vk::Buffer const bufferHandle = *myBuffers.emplace (std::move (buffer)).first;
-
-            return { memoryHandle, bufferHandle };
-        }
-
-        void destroy (vk::DeviceMemory const memory, vk::Buffer const buffer)
-        {
-            std::lock_guard lock { myMutex };
-
-            if (0 != myMemory.erase(memory)) [[likely]]
-                myBuffers.erase(buffer);
-        }
-
-    private:
-        std::mutex myMutex;
-
-        boost::unordered::unordered_flat_set <vk::raii::DeviceMemory, VulkanHash, VulkanEquals>
-        myMemory;
-
-        boost::unordered::unordered_flat_set <vk::raii::Buffer, VulkanHash, VulkanEquals>
-        myBuffers;
-    };
-
-    template <>
-    class BufferHandleStorage <false> final
-    {
-    public:
-        [[nodiscard]] std::pair <vk::DeviceMemory, vk::Buffer>
-        emplace (vk::raii::DeviceMemory&& memory, vk::raii::Buffer&& buffer)
-        {
-            myMemory.reserve (myMemory.size() + 1);
-            myBuffers.reserve (myBuffers.size() + 1);
-
-            vk::DeviceMemory const memoryHandle = *myMemory.emplace (std::move (memory)).first;
-            vk::Buffer const bufferHandle = *myBuffers.emplace (std::move (buffer)).first;
-
-            return { memoryHandle, bufferHandle };
-        }
-
-        void destroy (vk::DeviceMemory const memory, vk::Buffer const buffer) noexcept {
-            if (0 != myMemory.erase(memory)) [[likely]]
-                myBuffers.erase(buffer);
-        }
-
-    private:
-        boost::unordered::unordered_flat_set <vk::raii::DeviceMemory, VulkanHash, VulkanEquals>
-        myMemory;
-
-        boost::unordered::unordered_flat_set <vk::raii::Buffer, VulkanHash, VulkanEquals>
-        myBuffers;
-    };
-}
 
 namespace Ignis::Graphics
 {
     enum class BufferType
-        { immutable, mappable, constantly_mapped };
+    {
+        transferable,
+        temporary_mappable,
+        constantly_mapped,
+
+#if !NDEBUG
+        first_enum_value = transferable,
+        last_enum_value = constantly_mapped
+#endif
+    };
 
     enum class BufferUsage
-        { vertex, index, uniform, storage };
+    {
+        vertex,
+        index,
+        uniform,
+        storage,
+
+#if !NDEBUG
+        first_enum_value = vertex,
+        last_enum_value = storage
+#endif
+    };
 
     template <BufferType Type, BufferUsage Usage>
     class Buffer final
     {
-        Buffer (vk::DeviceMemory const memory, vk::Buffer const buffer, size_t const size)
+        Buffer (vma::Allocation const memory, vk::Buffer const buffer, size_t const size)
         noexcept :
             myMemory (memory),
             myBuffer (buffer),
@@ -138,7 +87,7 @@ namespace Ignis::Graphics
         [[nodiscard]] bool
         is_valid () const noexcept {
             return
-                myMemory != VK_NULL_HANDLE &&
+                myMemory &&
                 myBuffer != VK_NULL_HANDLE &&
                 mySize > 0;
         }
@@ -150,7 +99,7 @@ namespace Ignis::Graphics
         }
 
     private:
-        vk::DeviceMemory myMemory;
+        vma::Allocation myMemory;
         vk::Buffer myBuffer;
         size_t mySize;
     };
@@ -158,23 +107,27 @@ namespace Ignis::Graphics
     template <bool InternalSync>
     class BufferFactory :
         public virtual Detail::CoreDependent,
-        public virtual Detail::ResourceAllocator <InternalSync>
+        public virtual Detail::ResourceMemoryManager <InternalSync>
     {
-        using ResourceAllocator = Detail::ResourceAllocator <InternalSync>;
+        using ResourceMemoryManager = Detail::ResourceMemoryManager <InternalSync>;
 
         template <BufferType Type>
-        [[nodiscard]] static consteval Detail::MemoryType choose_memory_type () noexcept
+        [[nodiscard]] static consteval MemoryAccess get_memory_access () noexcept
         {
-            if constexpr (Type == BufferType::immutable)
-                return Detail::MemoryType::immutable;
+            if constexpr (Type == BufferType::transferable)
+                return MemoryAccess::transfer;
+
+            else if constexpr (Type == BufferType::temporary_mappable)
+                return MemoryAccess::temporary_mapped;
+
             else
-                return Detail::MemoryType::mappable;
+                return MemoryAccess::constantly_mapped;
         }
 
         template <BufferUsage Usage>
         [[nodiscard]] static vk::BufferUsageFlags get_usage_flags (
             bool transferRead,
-            bool transferWrite)
+            bool transferWrite) noexcept
         {
             vk::BufferUsageFlags flags;
 
@@ -187,7 +140,7 @@ namespace Ignis::Graphics
             else if constexpr (Usage == BufferUsage::uniform)
                 flags |= vk::BufferUsageFlagBits::eUniformBuffer;
 
-            else /* Usage == BufferUsage::storage */
+            else /* BufferUsage::storage */
             {
                 flags |= vk::BufferUsageFlagBits::eStorageBuffer;
 
@@ -205,8 +158,7 @@ namespace Ignis::Graphics
         }
 
         template <BufferUsage Usage>
-        [[nodiscard]] boost::container::small_flat_set <uint32_t, 2>
-        get_accessible_families (
+        [[nodiscard]] boost::container::small_flat_set <uint32_t, 2> get_accessible_families (
             bool const transferRead,
             bool const transferWrite) const noexcept
         {
@@ -225,8 +177,7 @@ namespace Ignis::Graphics
         }
 
         template <BufferUsage Usage>
-        [[nodiscard]] std::pair <vk::raii::Buffer, vk::MemoryRequirements>
-        create_buffer_and_memory_requirements (
+        [[nodiscard]] vk::raii::Buffer create_buffer (
             size_t const size,
             bool const allowTransferRead,
             bool const allowTransferWrite)
@@ -245,14 +196,7 @@ namespace Ignis::Graphics
                 families.sequence().data()
             };
 
-            auto const requirements = device.getBufferMemoryRequirements
-                ({ &createInfo }).memoryRequirements;
-
-            return {
-                std::piecewise_construct,
-                std::forward_as_tuple (device, createInfo),
-                std::forward_as_tuple (requirements)
-            };
+            return { device, createInfo };
         }
 
     protected:
@@ -263,47 +207,56 @@ namespace Ignis::Graphics
             CoreDependent (core)
         {}
 
-        template <BufferType Type, BufferUsage Usage>
-            requires ((
-                Type == BufferType::mappable ||
-                Type == BufferType::immutable ||
-                Type == BufferType::constantly_mapped)
-            &&
-               (Usage == BufferUsage::vertex ||
-                Usage == BufferUsage::index ||
-                Usage == BufferUsage::uniform ||
-                Usage == BufferUsage::storage))
+        template <BufferType Type,
+                  BufferUsage Usage,
+                  MemoryPlacement Placement>
+        requires (Detail::is_enum_valid (Type) &&
+                  Detail::is_enum_valid (Usage) &&
+                  Detail::is_enum_valid (Placement))
         [[nodiscard]] Buffer <Type, Usage> make_buffer (
             size_t const size,
-            PreferMemory const memoryPreference,
             bool const allowTransferRead,
             bool const allowTransferWrite)
         {
             assert (size > 0);
 
-            if constexpr (Type == BufferType::immutable)
-                assert (!allowTransferWrite);
+            if constexpr (Type == BufferType::transferable)
+                assert (allowTransferWrite);
 
-            auto [buffer, memoryRequirements] = create_buffer_and_memory_requirements
-                <Usage> (size, allowTransferRead, allowTransferWrite);
+            else if constexpr (Usage == BufferUsage::storage)
+                assert (allowTransferRead && allowTransferWrite);
 
-            auto constexpr memoryType = choose_memory_type <Type> ();
-            auto memory = ResourceAllocator::template
-                allocate <memoryType> (memoryRequirements, memoryPreference);
+            auto constexpr memory_access = get_memory_access <Type> ();
 
-            auto const [memoryHandle, bufferHandle] = myStorage.emplace (std::move (memory), std::move (buffer));
+            auto buffer = create_buffer <Usage> (size, allowTransferRead, allowTransferWrite);
+            auto memory = ResourceMemoryManager::template make_allocation <memory_access, Placement> (*buffer);
 
-            return { memoryHandle, bufferHandle, size };
+            ResourceMemoryManager::bind_to_resource(buffer, memory);
+
+            [[maybe_unused]] auto const lock =
+                Detail::lock_mutex <InternalSync, std::lock_guard> (myMutex);
+
+            auto const bufferHandle = **myBuffers.emplace (std::move(buffer)).first;
+            return { memory, bufferHandle, size };
         }
 
         template <BufferType Type, BufferUsage Usage>
         void destroy_buffer (Buffer <Type, Usage> const buffer)
-        noexcept (!InternalSync) {
-            myStorage.destroy (buffer.myMemory, buffer.myBuffer);
+        noexcept (!InternalSync)
+        {
+            [[maybe_unused]] auto const lock =
+               Detail::lock_mutex <InternalSync, std::lock_guard> (myMutex);
+
+            ResourceMemoryManager::destroy_allocation (buffer.myMemory);
+            myBuffers.erase (buffer.myBuffer);
         }
 
     private:
-        Detail::BufferHandleStorage <InternalSync> myStorage;
+        [[no_unique_address]] Detail::EnableMutex <InternalSync, std::mutex> myMutex;
+
+        boost::unordered::unordered_flat_set
+            <vk::raii::Buffer, Detail::VulkanHash, Detail::VulkanEquals>
+        myBuffers;
     };
 }
 

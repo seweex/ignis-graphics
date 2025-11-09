@@ -11,163 +11,36 @@
 
 namespace Ignis::Detail
 {
-    class MemoryMapping final
-    {
-    public:
-        MemoryMapping (
-            size_t const size,
-            size_t const offset,
-            vk::Device const device,
-            vk::DeviceMemory const memory,
-            vk::raii::detail::DeviceDispatcher const* dispatcher)
-        :
-            myDispatcher (dispatcher),
-            myDevice (device),
-            myMemory (memory)
-        {
-            myPointer = myDevice.mapMemory
-                (myMemory, offset, size, {}, *dispatcher);
-        }
-
-        ~MemoryMapping() noexcept {
-            release();
-        }
-
-        MemoryMapping (MemoryMapping&& other)
-        noexcept :
-            myDispatcher (std::exchange (other.myDispatcher, nullptr)),
-            myDevice (std::exchange (other.myDevice, VK_NULL_HANDLE)),
-            myMemory (std::exchange (other.myMemory, VK_NULL_HANDLE)),
-            myPointer (std::exchange (other.myPointer, nullptr))
-        {}
-
-        MemoryMapping& operator=(MemoryMapping&& other) noexcept
-        {
-            if (this == &other) [[unlikely]]
-                return *this;
-
-            release();
-
-            myDispatcher = std::exchange (other.myDispatcher, nullptr);
-            myDevice = std::exchange (other.myDevice, VK_NULL_HANDLE);
-            myMemory = std::exchange (other.myMemory, VK_NULL_HANDLE);
-            myPointer = std::exchange (other.myPointer, nullptr);
-
-            return *this;
-        }
-
-        MemoryMapping (MemoryMapping const&) = delete;
-        MemoryMapping& operator=(MemoryMapping const&) = delete;
-
-        [[nodiscard]] bool owns_mapping () const noexcept {
-            return myPointer != nullptr;
-        }
-
-        [[nodiscard]] void* get_pointer () const noexcept {
-            assert (owns_mapping());
-            return myPointer;
-        }
-
-        void release () noexcept {
-            if (owns_mapping()) {
-                myDevice.unmapMemory (myMemory, *myDispatcher);
-                myPointer = nullptr;
-            }
-        }
-
-    private:
-        vk::raii::detail::DeviceDispatcher const* myDispatcher;
-
-        vk::Device myDevice;
-        vk::DeviceMemory myMemory;
-
-        void* myPointer;
-    };
-
     template <bool InternalSync>
     class TransferManager :
         public virtual Detail::CoreDependent,
+        public virtual Detail::ResourceMemoryDispatcher,
         public virtual Detail::TransferScheduler <InternalSync>
     {
+        using ResourceMemoryDispatcher = Detail::ResourceMemoryDispatcher;
         using TransferScheduler = Detail::TransferScheduler <InternalSync>;
-
-        [[nodiscard]] void*
-        find_constantly_mapped (vk::DeviceMemory const memory) noexcept (!InternalSync)
-        {
-            [[maybe_unused]] auto const lock = Detail::lock_mutex
-                <InternalSync, std::shared_lock> (myConstantlyMappingsMutex);
-
-            if (auto const iter = myConstantlyMappings.find (memory);
-                iter != myConstantlyMappings.end()) [[likely]]
-                return iter->second.get_pointer();
-            else
-                return nullptr;
-        }
-
-        [[nodiscard]] void*
-        emplace_constantly_mapped (vk::DeviceMemory const memory, size_t const size)
-        {
-            auto const& device = CoreDependent::get_device();
-            auto const dispatcher = &CoreDependent::get_dispatcher();
-
-            [[maybe_unused]] auto const lock = Detail::lock_mutex
-                <InternalSync, std::unique_lock> (myConstantlyMappingsMutex);
-
-            [[maybe_unused]] auto const [iter, inserted] = myConstantlyMappings.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple (memory),
-                std::forward_as_tuple (size, 0, device, memory, dispatcher));
-
-            auto const& mapping = iter->second;
-            return mapping.get_pointer();
-        }
-
-        [[nodiscard]] Detail::MemoryMapping
-        make_temporary_mapping (
-            vk::DeviceMemory const memory,
-            size_t const size,
-            size_t const offset) const
-        {
-            auto const device = *CoreDependent::get_device();
-            auto const dispatcher = &CoreDependent::get_dispatcher();
-
-            return Detail::MemoryMapping { size, offset, device, memory, dispatcher };
-        }
 
     protected:
         TransferManager () noexcept = default;
 
     public:
         template <Graphics::BufferType Type, Graphics::BufferUsage Usage>
-        requires (
-            Type == Graphics::BufferType::constantly_mapped ||
-            Type == Graphics::BufferType::immutable)
+        requires (Type == Graphics::BufferType::constantly_mapped ||
+                  Type == Graphics::BufferType::temporary_mappable)
         void copy (
             Graphics::Buffer <Type, Usage> const destination,
             void const* const source,
             size_t const size,
             size_t const offset)
         {
-            assert (size > 0);
+            assert (source && size > 0);
+            assert (destination.is_valid() && destination.mySize >= size + offset);
 
-            assert (destination.is_valid());
-            assert (destination.mySize >= size + offset);
+            auto const mapping = ResourceMemoryDispatcher::map_memory (destination.myMemory);
+            auto const destPointer = static_cast <std::byte*> (mapping.get_pointer()) + offset;
 
-            if constexpr (Type == Graphics::BufferType::constantly_mapped)
-            {
-                auto pointer = find_constantly_mapped (destination.myMemory);
-
-                if (!pointer) [[unlikely]]
-                    pointer = emplace_constantly_mapped (destination.myMemory, destination.mySize);
-
-                std::memcpy (pointer, source, size);
-            }
-            else {
-                auto const mapping = make_temporary_mapping (destination.myMemory, size, offset);
-                auto const pointer = mapping.get_pointer();
-
-                std::memcpy (pointer, source, size);
-            }
+            std::memcpy (destPointer, source, size);
+            ResourceMemoryDispatcher::flush (destination.myMemory, size, offset);
         }
 
         template <Graphics::BufferType DestType,
@@ -182,9 +55,7 @@ namespace Ignis::Detail
             size_t const sourceOffset)
         {
             assert (size > 0);
-
-            assert (source.is_valid());
-            assert (destination.is_valid());
+            assert (source.is_valid() && destination.is_valid());
 
             assert (source.mySize >= size + sourceOffset);
             assert (destination.mySize >= size + destinationOffset);
@@ -202,15 +73,6 @@ namespace Ignis::Detail
             commands.end();
             TransferScheduler::postpone_transfer_commands (std::move (commands));
         }
-
-    private:
-        [[no_unique_address]] Detail::EnableMutex <InternalSync, std::shared_mutex>
-        mutable myConstantlyMappingsMutex;
-
-        alignas (InternalSync ? 64 : alignof(void*)) boost::unordered_flat_map
-            <vk::DeviceMemory, Detail::MemoryMapping,
-            Detail::VulkanHash, Detail::VulkanEquals>
-        myConstantlyMappings;
     };
 }
 

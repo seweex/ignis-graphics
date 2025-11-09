@@ -1,9 +1,9 @@
-#ifndef IGNIS_DETAIL_MEMORY_ALLOCATOR_HXX
-#define IGNIS_DETAIL_MEMORY_ALLOCATOR_HXX
+#ifndef IGNIS_DETAIL_RESOURCE_MEMORY_HXX
+#define IGNIS_DETAIL_RESOURCE_MEMORY_HXX
 
 #include <vulkan/vulkan_raii.hpp>
-#include <ignis/detail/include_vulkan_allocator.hxx>
 
+#include <ignis/detail/include_vulkan_allocator.hxx>
 #include <ignis/detail/core_dependent.hxx>
 
 namespace Ignis::Graphics
@@ -11,23 +11,23 @@ namespace Ignis::Graphics
     enum class MemoryAccess
     {
         transfer,
-        to_temporary_mapped,
-        to_constantly_mapped,
+        temporary_mapped,
+        constantly_mapped,
 
 #if !NDEBUG
         first_enum_value = transfer,
-        last_enum_value = to_constantly_mapped
+        last_enum_value = constantly_mapped
 #endif
     };
 
     enum class MemoryPlacement
     {
-        in_device,
-        in_host,
+        device,
+        host,
         no_matter,
 
 #if !NDEBUG
-        first_enum_value = in_device,
+        first_enum_value = device,
         last_enum_value = no_matter
 #endif
     };
@@ -35,6 +35,76 @@ namespace Ignis::Graphics
 
 namespace Ignis::Detail
 {
+    class MemoryMapping final
+    {
+    public:
+        MemoryMapping (
+            vma::Allocator const allocator,
+            vma::Allocation const allocation)
+        :
+            myAllocator  (allocator),
+            myAllocation (allocation),
+            myPointer    (allocator.mapMemory (allocation))
+        {}
+
+        explicit MemoryMapping (void* const mapped) noexcept :
+            myAllocator (nullptr),
+            myAllocation (nullptr),
+            myPointer (mapped)
+        {}
+
+        ~MemoryMapping() noexcept {
+            release();
+        }
+
+        MemoryMapping (MemoryMapping&& other)
+        noexcept :
+            myAllocator  (std::exchange (other.myAllocator, nullptr)),
+            myAllocation (std::exchange (other.myAllocation, nullptr)),
+            myPointer    (std::exchange (other.myPointer, nullptr))
+        {}
+
+        MemoryMapping& operator=(MemoryMapping&& other) noexcept
+        {
+            if (this == &other) [[unlikely]]
+                return *this;
+
+            release();
+
+            myAllocator  = std::exchange (other.myAllocator, nullptr);
+            myAllocation = std::exchange (other.myAllocation, nullptr);
+            myPointer    = std::exchange (other.myPointer, nullptr);
+
+            return *this;
+        }
+
+        MemoryMapping (MemoryMapping const&) = delete;
+        MemoryMapping& operator=(MemoryMapping const&) = delete;
+
+        [[nodiscard]] bool owns_mapping () const noexcept {
+            return myPointer && myAllocator && myAllocation;
+        }
+
+        [[nodiscard]] void* get_pointer () const noexcept {
+            assert (owns_mapping());
+            return myPointer;
+        }
+
+        void release () noexcept
+        {
+            if (owns_mapping()) {
+                myAllocator.unmapMemory (myAllocation);
+                myPointer = nullptr;
+            }
+        }
+
+    private:
+        vma::Allocator myAllocator;
+        vma::Allocation myAllocation;
+
+        void* myPointer;
+    };
+
     class ResourceMemoryAllocator :
         public virtual CoreDependent
     {
@@ -86,7 +156,7 @@ namespace Ignis::Detail
                 nullptr,
                 &vulkanFunctions,
                 CoreDependent::get_instance(),
-                static_cast <uint32_t> (CoreDependent::get_device_dispatcher().getVkHeaderVersion()),
+                CoreDependent::get_vulkan_version(),
                 nullptr
             };
 
@@ -99,13 +169,13 @@ namespace Ignis::Detail
             constexpr auto common_flags =
                 vma::AllocationCreateFlagBits::eStrategyBestFit;
 
-            if constexpr (Access == Graphics::MemoryAccess::to_constantly_mapped)
+            if constexpr (Access == Graphics::MemoryAccess::constantly_mapped)
                 return
                     vma::AllocationCreateFlagBits::eMapped |
                     vma::AllocationCreateFlagBits::eHostAccessSequentialWrite |
                     common_flags;
 
-            else if constexpr (Access == Graphics::MemoryAccess::to_temporary_mapped)
+            else if constexpr (Access == Graphics::MemoryAccess::temporary_mapped)
                 return
                     vma::AllocationCreateFlagBits::eHostAccessSequentialWrite |
                     common_flags;
@@ -114,30 +184,21 @@ namespace Ignis::Detail
                 return common_flags;
         }
 
-        template <Graphics::MemoryPlacement Placement>
-        [[nodiscard]] static constexpr vma::MemoryUsage make_usage_flags () noexcept
-        {
-            if constexpr (Placement == Graphics::MemoryPlacement::in_device)
-                return vma::MemoryUsage::eAutoPreferDevice;
-
-            else if constexpr (Placement == Graphics::MemoryPlacement::in_host)
-                return vma::MemoryUsage::eAutoPreferHost;
-
-            else
-                return vma::MemoryUsage::eAuto;
-        }
-
     protected:
         ResourceMemoryAllocator () :
             myAllocator (make_allocator())
         {}
 
-        template <Graphics::MemoryAccess Access, Graphics::MemoryPlacement Placement>
-        [[nodiscard]] vma::UniqueAllocation make_allocation (vk::Buffer const buffer)
+        template <Graphics::MemoryAccess Access,
+                  Graphics::MemoryPlacement Placement,
+                  class AllocateForHandle>
+        requires (std::same_as <AllocateForHandle, vk::Buffer> ||
+                  std::same_as <AllocateForHandle, vk::Image>)
+        [[nodiscard]] vma::UniqueAllocation allocate (AllocateForHandle const resourceHandle)
         {
             vma::AllocationCreateInfo const allocationInfo {
                 make_allocation_flags <Access> (),
-                make_usage_flags <Placement> (),
+                {},
                 {},
                 {},
                 {},
@@ -146,11 +207,14 @@ namespace Ignis::Detail
                 1.f
             };
 
-            return myAllocator->allocateMemoryForBufferUnique (buffer, allocationInfo);
+            if constexpr (std::same_as <AllocateForHandle, vk::Buffer>)
+                return myAllocator->allocateMemoryForBufferUnique (resourceHandle, allocationInfo);
+            else
+                return myAllocator->allocateMemoryForImageUnique (resourceHandle, allocationInfo);
         }
 
         template <Graphics::MemoryAccess Access, Graphics::MemoryPlacement Placement>
-        [[nodiscard]] vma::UniqueAllocation make_allocation (vk::Image const image)
+        [[nodiscard]] vma::UniqueAllocation allocate (vk::Image const image)
         {
             vma::AllocationCreateInfo const allocationInfo {
                 make_allocation_flags <Access> (),
@@ -166,6 +230,11 @@ namespace Ignis::Detail
             return myAllocator->allocateMemoryForImageUnique (image, allocationInfo);
         }
 
+        [[nodiscard]] vma::Allocator get_allocator() const noexcept {
+            return myAllocator.get();
+        }
+
+    private:
         vma::UniqueAllocator myAllocator;
     };
 
@@ -176,7 +245,29 @@ namespace Ignis::Detail
     protected:
         ResourceMemoryFactory () = default;
 
-        [[nodo]]
+        template <Graphics::MemoryAccess Access,
+                  Graphics::MemoryPlacement Placement,
+                  class AllocateForHandle>
+        requires (std::same_as <AllocateForHandle, vk::Buffer> ||
+                  std::same_as <AllocateForHandle, vk::Image>)
+        [[nodiscard]] vma::Allocation make_allocation (AllocateForHandle const resourceHandle)
+        {
+            auto allocation = ResourceMemoryAllocator::allocate <Access, Placement> (resourceHandle);
+
+            [[maybe_unused]] auto const lock = lock_mutex <InternalSync, std::lock_guard> (myMutex);
+            [[maybe_unused]] auto const [iter, inserted] = myAllocations.emplace (std::move (allocation));
+
+            auto const allocationHandle = iter->get();
+            return allocationHandle;
+        }
+
+        void destroy_allocation (vma::Allocation const allocation) noexcept(!InternalSync)
+        {
+            [[maybe_unused]] auto const lock =
+                lock_mutex <InternalSync, std::lock_guard> (myMutex);
+
+            myAllocations.erase (allocation);
+        }
 
     private:
         [[no_unique_address]] EnableMutex <InternalSync, std::mutex> myMutex;
@@ -186,6 +277,51 @@ namespace Ignis::Detail
             <vma::UniqueAllocation, VulkanHash, VulkanEquals>
         myAllocations;
     };
+
+    class ResourceMemoryDispatcher :
+        public virtual ResourceMemoryAllocator
+    {
+    protected:
+        ResourceMemoryDispatcher () = default;
+
+        template <class Handle>
+        requires (std::same_as <Handle, vk::raii::Buffer> ||
+                  std::same_as <Handle, vk::raii::Image>)
+        void bind_to_resource (Handle& resource, vma::Allocation const allocation)
+        {
+            auto const allocator = ResourceMemoryAllocator::get_allocator();
+            auto const info = allocator.getAllocationInfo(allocation);
+
+            resource.bindMemory (info.deviceMemory, info.offset);
+        }
+
+        [[nodiscard]] MemoryMapping
+        map_memory (vma::Allocation const allocation) const
+        {
+            auto const allocator = get_allocator();
+
+            if (auto const info = allocator.getAllocationInfo(allocation);
+                info.pMappedData) [[unlikely]]
+                return MemoryMapping { info.pMappedData };
+            else
+                return MemoryMapping { allocator, allocation };
+        }
+
+        void flush (
+            vma::Allocation const allocation,
+            size_t const size,
+            size_t const offset) const
+        {
+            auto const allocator = ResourceMemoryAllocator::get_allocator();
+            allocator.flushAllocation (allocation, offset, size);
+        }
+    };
+
+    template <bool InternalSync>
+    class ResourceMemoryManager :
+        public virtual ResourceMemoryFactory <InternalSync>,
+        public virtual ResourceMemoryDispatcher
+    {};
 }
 
 #endif
