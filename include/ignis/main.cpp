@@ -20,11 +20,11 @@ int main ()
 
     (void) factory.make_buffer
         <Graphics::BufferType::constantly_mapped, Graphics::BufferUsage::vertex, Graphics::MemoryPlacement::host>
-            (1ull * 1024 *1024 * 1024, false, false);
+            (12ull * 1024 *1024 * 1024, false, false);
 
     (void) factory.make_buffer
         <Graphics::BufferType::transferable, Graphics::BufferUsage::storage, Graphics::MemoryPlacement::no_matter>
-            (3ull * 1024 *1024 * 1024, false, true);
+            (3ull * 1024 * 1024 * 1024, false, true);
 
     for (;;);
 

@@ -101,6 +101,7 @@ namespace Ignis::Graphics
     private:
         vma::Allocation myMemory;
         vk::Buffer myBuffer;
+
         size_t mySize;
     };
 
