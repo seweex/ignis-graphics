@@ -6,16 +6,88 @@
 #include <mutex>
 
 #include <boost/unordered/unordered_flat_set.hpp>
-#include <vulkan/vulkan_raii.hpp>
 
+#include <vulkan/vulkan_raii.hpp>
+#include <shaderc/shaderc.hpp>
+
+#include <ignis/detail/debug_assert.hxx>
 #include <ignis/detail/vulkan_functional.hxx>
 #include <ignis/detail/core_dependent.hxx>
 
+namespace Ignis::Detail
+{
+    template <class Ty>
+    concept ShaderBinaryCode =
+        std::ranges::contiguous_range <Ty> &&
+        std::ranges::sized_range <Ty> &&
+        std::same_as <std::ranges::range_value_t <Ty>, uint32_t>;
+}
+
 namespace Ignis::Graphics
 {
+    enum class ShaderType
+    {
+        vertex,
+        fragment,
+        geometry,
+        compute,
+        tesselation_control,
+        tesselation_evaluation,
+
+#if !NDEBUG
+        first_enum_value = vertex,
+        last_enum_value = tesselation_evaluation
+#endif
+    };
+
+    enum class CompileOptimization
+    {
+        size,
+        performance,
+
+#if !NDEBUG
+        first_enum_value = size,
+        last_enum_value = performance
+#endif
+    };
+
+    template <ShaderType Type>
+    class ShaderBinary final
+    {
+        template <class BinaryTy>
+        ShaderBinary (BinaryTy&& binary, [[maybe_unused]] std::true_type isVector) noexcept :
+            myCode (std::move (binary))
+        {}
+
+        template <class BinaryTy>
+        ShaderBinary (BinaryTy&& binary, [[maybe_unused]] std::false_type isVector) :
+            myCode (binary.begin(), binary.end())
+        {}
+
+    public:
+        template <class BinaryTy>
+            requires (Detail::ShaderBinaryCode <BinaryTy> &&
+                !std::same_as <std::remove_cvref_t <BinaryTy>, ShaderBinary>)
+        explicit ShaderBinary (BinaryTy&& binary)
+            noexcept (std::is_same_v <std::remove_cvref_t <BinaryTy>, std::vector <uint32_t>>)
+        :
+            ShaderBinary (std::forward <BinaryTy> (binary), std::is_same <BinaryTy, std::vector <uint32_t>>{})
+        {}
+
+        ShaderBinary (ShaderBinary&&) noexcept = default;
+        ShaderBinary (ShaderBinary const&) noexcept = default;
+
+        ShaderBinary& operator=(ShaderBinary&&) = default;
+        ShaderBinary& operator=(ShaderBinary const&) = default;
+
+    private:
+        std::vector <uint32_t> myCode;
+    };
+
+    template <ShaderType Type>
     class Shader final
     {
-        Shader (vk::ShaderModule const shader) noexcept :
+        explicit Shader (vk::ShaderModule const shader) noexcept :
             myShader (shader)
         {}
 
@@ -48,6 +120,97 @@ namespace Ignis::Graphics
         vk::ShaderModule myShader;
     };
 
+    class ShaderCompiler final
+    {
+        template <ShaderType Type>
+        [[nodiscard]] static consteval shaderc_shader_kind get_shader_kind () noexcept
+        {
+            switch (Type)
+            {
+            case ShaderType::vertex:
+                return shaderc_vertex_shader;
+
+            case ShaderType::compute:
+                return shaderc_compute_shader;
+
+            case ShaderType::fragment:
+                return shaderc_fragment_shader;
+
+            case ShaderType::geometry:
+                return shaderc_geometry_shader;
+
+            case ShaderType::tesselation_control:
+                return shaderc_tess_control_shader;
+
+            case ShaderType::tesselation_evaluation:
+                return shaderc_tess_evaluation_shader;
+            }
+        }
+
+    public:
+        explicit ShaderCompiler (Core const& core) {
+            myOptions.SetTargetEnvironment (
+                shaderc_target_env_vulkan, core.get_vulkan_version());
+        }
+
+        [[nodiscard]] ShaderCompiler&
+        push_macro (std::string_view const name, std::string_view const value = {})
+        {
+            myOptions.AddMacroDefinition (name.data(), name.size(), value.data(), value.size());
+            return *this;
+        }
+
+        [[nodiscard]] ShaderCompiler&
+        enable_debug () {
+            myOptions.SetGenerateDebugInfo();
+            return *this;
+        }
+
+        [[nodiscard]] ShaderCompiler&
+        optimize (CompileOptimization const optimization)
+        {
+            assert (Detail::is_enum_valid (optimization));
+
+            switch (optimization)
+            {
+            case CompileOptimization::performance:
+                myOptions.SetOptimizationLevel (shaderc_optimization_level_performance);
+                break;
+
+            case CompileOptimization::size:
+                myOptions.SetOptimizationLevel (shaderc_optimization_level_size);
+                break;
+            }
+
+            return *this;
+        }
+
+        template <ShaderType Type>
+            requires (Detail::is_enum_valid (Type))
+        [[nodiscard]] ShaderBinary <Type> compile (
+            std::string_view const source,
+            std::string_view const name,
+            std::string_view const entry = "main")
+        {
+            assert (!source.empty());
+            assert (!name.empty());
+            assert (!entry.empty());
+
+            auto constexpr kind = get_shader_kind <Type> ();
+            auto const result = myCompiler.CompileGlslToSpv (
+                source.data(), source.size(), kind, name.data(), entry.data(), myOptions);
+
+            if (result.GetCompilationStatus() != shaderc_compilation_status_success) [[unlikely]]
+                throw std::runtime_error { result.GetErrorMessage() };
+
+            return ShaderBinary <Type> { result };
+        }
+
+    private:
+        shaderc::CompileOptions myOptions;
+        shaderc::Compiler myCompiler;
+    };
+
     template <bool InternalSync>
     class ShaderFactory :
         public virtual Detail::CoreDependent
@@ -55,9 +218,6 @@ namespace Ignis::Graphics
         [[nodiscard]] vk::raii::ShaderModule
         create_shader (size_t const size, void const* const data) const
         {
-            assert (size > 0 && size % sizeof(uint32_t) == 0);
-            assert (data);
-
             vk::ShaderModuleCreateInfo const createInfo
                 { {}, size, static_cast <uint32_t const*> (data) };
 
@@ -72,9 +232,13 @@ namespace Ignis::Graphics
             CoreDependent (core)
         {}
 
-        [[nodiscard]] Shader make_shader (size_t const size, void const* const binary)
+        template <ShaderType Type>
+        [[nodiscard]] Shader <Type> make_shader (ShaderBinary <Type> const& binary)
         {
-            auto shader = create_shader (size, binary);
+            assert (!binary.myCode.empty());
+
+            auto shader = create_shader (
+                binary.myCode.size() * sizeof(uint32_t), binary.myCode.data());
 
             [[maybe_unused]] auto const lock =
                 Detail::lock_mutex <InternalSync, std::lock_guard> (myMutex);
@@ -83,6 +247,15 @@ namespace Ignis::Graphics
                 myShaders.emplace (std::move (shader));
 
             return Shader { iter->first };
+        }
+
+        template <ShaderType Type>
+        void destroy_shader (Shader <Type> const shader) noexcept (!InternalSync)
+        {
+            [[maybe_unused]] auto const lock =
+                Detail::lock_mutex <InternalSync, std::lock_guard> (myMutex);
+
+            myShaders.erase (shader.myShader);
         }
 
     private:

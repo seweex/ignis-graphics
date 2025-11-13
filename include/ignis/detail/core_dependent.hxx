@@ -83,7 +83,7 @@ namespace Ignis::Detail
 
         [[nodiscard]] uint32_t
         get_vulkan_version () const {
-            return myCore->myContext.enumerateInstanceVersion();
+            return myCore->get_vulkan_version();
         }
 
     private:

@@ -354,6 +354,11 @@ namespace Ignis::Graphics
             myDevice = make_device();
         }
 
+        [[nodiscard]] uint32_t
+        get_vulkan_version() const noexcept {
+            return myContext.enumerateInstanceVersion();
+        }
+
     private:
         vk::raii::Context myContext;
         vk::raii::Instance myInstance;

@@ -6,7 +6,7 @@
     #define IGNIS_VMA_INCLUDED
     #define VMA_IMPLEMENTATION
 
-    #include <vulkan/vulkan.hpp>
+    #include <vulkan/vulkan_raii.hpp>
     #include <vma/vk_mem_alloc.h>
 
     #include <vk_mem_alloc.hpp>

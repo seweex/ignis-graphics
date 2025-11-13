@@ -1,9 +1,11 @@
 
 #include <iostream>
 
+#include <ignis/detail/include_vulkan_allocator.hxx>
 #include <ignis/graphics/window.hxx>
 #include <ignis/graphics/core.hxx>
 #include <ignis/graphics/buffer.hxx>
+#include <ignis/graphics/render_pass.hxx>
 
 int main ()
 {
@@ -16,15 +18,19 @@ int main ()
 
     auto const core = std::make_shared <Graphics::Core> (window, app, eng);
 
-    Graphics::BufferFactory <false> factory { core };
+    Graphics::RenderPassFactory <false> factory { core };
 
-    (void) factory.make_buffer
-        <Graphics::BufferType::constantly_mapped, Graphics::BufferUsage::vertex, Graphics::MemoryPlacement::host>
-            (12ull * 1024 *1024 * 1024, false, false);
-
-    (void) factory.make_buffer
-        <Graphics::BufferType::transferable, Graphics::BufferUsage::storage, Graphics::MemoryPlacement::no_matter>
-            (3ull * 1024 * 1024 * 1024, false, true);
+    auto renderPass =
+        factory.build_render_pass()
+        .begin_subpass("Default")
+            .color_attachment (32)
+            .msaa_attachment ()
+        .end_subpass()
+        .begin_subpass ("Depth")
+            .depth_attachment ()
+            .depend_on ("Default")
+        .end_subpass()
+        .confirm();
 
     for (;;);
 
