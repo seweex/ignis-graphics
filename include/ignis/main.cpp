@@ -6,6 +6,7 @@
 #include <ignis/graphics/core.hxx>
 #include <ignis/graphics/buffer.hxx>
 #include <ignis/graphics/render_pass.hxx>
+#include <ignis/detail/swapchain.hxx>
 
 int main ()
 {
@@ -17,8 +18,12 @@ int main ()
     Graphics::Window window { 640, 480, "Test", Graphics::WindowType::unresizable };
 
     auto const core = std::make_shared <Graphics::Core> (window, app, eng);
+    auto const allocator = std::make_shared <Detail::ResourceMemoryAllocator> (core);
 
-    Graphics::RenderPassFactory <false> factory { core };
+    auto const swapchain = std::make_shared <Detail::Swapchain> (core, 3, true);
+    auto const depth = std::make_shared <Detail::DepthManager <false>> (allocator, vk::Extent2D{ 640, 480 }, 3);
+
+    Graphics::RenderPassFactory <false> factory { swapchain, depth };
 
     auto renderPass =
         factory.build_render_pass()

@@ -6,6 +6,7 @@
 #include <mutex>
 
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 
 #include <vulkan/vulkan_raii.hpp>
 #include <shaderc/shaderc.hpp>
@@ -13,6 +14,8 @@
 #include <ignis/detail/debug_assert.hxx>
 #include <ignis/detail/vulkan_functional.hxx>
 #include <ignis/detail/core_dependent.hxx>
+
+#include "ignis/detail/enable_sync.hxx"
 
 namespace Ignis::Detail
 {
@@ -25,6 +28,9 @@ namespace Ignis::Detail
 
 namespace Ignis::Graphics
 {
+    template <bool InternalSync>
+    class ShaderFactory;
+
     enum class ShaderType
     {
         vertex,
@@ -55,19 +61,21 @@ namespace Ignis::Graphics
     class ShaderBinary final
     {
         template <class BinaryTy>
-        ShaderBinary (BinaryTy&& binary, [[maybe_unused]] std::true_type isVector) noexcept :
+        ShaderBinary (BinaryTy&& binary, [[maybe_unused]] std::true_type const isVector) noexcept :
             myCode (std::move (binary))
         {}
 
         template <class BinaryTy>
-        ShaderBinary (BinaryTy&& binary, [[maybe_unused]] std::false_type isVector) :
+        ShaderBinary (BinaryTy&& binary, [[maybe_unused]] std::false_type const isVector) :
             myCode (binary.begin(), binary.end())
         {}
 
+        template <bool InternalSync>
+        friend class ShaderFactory;
+
     public:
-        template <class BinaryTy>
-            requires (Detail::ShaderBinaryCode <BinaryTy> &&
-                !std::same_as <std::remove_cvref_t <BinaryTy>, ShaderBinary>)
+        template <Detail::ShaderBinaryCode BinaryTy>
+            requires (!std::same_as <std::remove_cvref_t <BinaryTy>, ShaderBinary>)
         explicit ShaderBinary (BinaryTy&& binary)
             noexcept (std::is_same_v <std::remove_cvref_t <BinaryTy>, std::vector <uint32_t>>)
         :
@@ -79,6 +87,15 @@ namespace Ignis::Graphics
 
         ShaderBinary& operator=(ShaderBinary&&) = default;
         ShaderBinary& operator=(ShaderBinary const&) = default;
+
+        [[nodiscard]] bool
+        empty () const noexcept {
+            return myCode.empty();
+        }
+
+        void clear () noexcept {
+            return myCode.clear();
+        }
 
     private:
         std::vector <uint32_t> myCode;
@@ -120,7 +137,8 @@ namespace Ignis::Graphics
         vk::ShaderModule myShader;
     };
 
-    class ShaderCompiler final
+    class ShaderCompiler final :
+        public Detail::VulkanApiDependent
     {
         template <ShaderType Type>
         [[nodiscard]] static consteval shaderc_shader_kind get_shader_kind () noexcept
@@ -148,14 +166,24 @@ namespace Ignis::Graphics
         }
 
     public:
-        explicit ShaderCompiler (Core const& core) {
+        explicit ShaderCompiler (std::weak_ptr <Core> const& core) :
+            CoreDependent (core)
+        {
             myOptions.SetTargetEnvironment (
-                shaderc_target_env_vulkan, core.get_vulkan_version());
+                shaderc_target_env_vulkan, VulkanApiDependent::get_vulkan_version());
         }
+
+        ShaderCompiler (ShaderCompiler &&) noexcept = default;
+        ShaderCompiler (ShaderCompiler const&) = delete;
+
+        ShaderCompiler& operator=(ShaderCompiler &&) = delete;
+        ShaderCompiler& operator=(ShaderCompiler const&) = delete;
 
         [[nodiscard]] ShaderCompiler&
         push_macro (std::string_view const name, std::string_view const value = {})
         {
+            assert (!name.empty());
+
             myOptions.AddMacroDefinition (name.data(), name.size(), value.data(), value.size());
             return *this;
         }
@@ -212,8 +240,8 @@ namespace Ignis::Graphics
     };
 
     template <bool InternalSync>
-    class ShaderFactory :
-        public virtual Detail::CoreDependent
+    class ShaderFactory final :
+        public Detail::DeviceDependent
     {
         [[nodiscard]] vk::raii::ShaderModule
         create_shader (size_t const size, void const* const data) const
@@ -221,16 +249,19 @@ namespace Ignis::Graphics
             vk::ShaderModuleCreateInfo const createInfo
                 { {}, size, static_cast <uint32_t const*> (data) };
 
-            return { CoreDependent::get_device(), createInfo };
+            return { DeviceDependent::get_device(), createInfo };
         }
-
-    protected:
-        ShaderFactory () noexcept = default;
 
     public:
         explicit ShaderFactory (std::weak_ptr <Core> const& core) :
             CoreDependent (core)
         {}
+
+        ShaderFactory (ShaderFactory &&) = delete;
+        ShaderFactory (ShaderFactory const&) = delete;
+
+        ShaderFactory& operator=(ShaderFactory &&) = delete;
+        ShaderFactory& operator=(ShaderFactory const&) = delete;
 
         template <ShaderType Type>
         [[nodiscard]] Shader <Type> make_shader (ShaderBinary <Type> const& binary)
@@ -264,17 +295,6 @@ namespace Ignis::Graphics
         boost::unordered::unordered_flat_map
             <vk::raii::ShaderModule, Detail::VulkanHash, Detail::VulkanEquals>
         myShaders;
-    };
-
-    template <bool InternalSync>
-    class ShaderManager :
-        public virtual Detail::CoreDependent,
-        public virtual ShaderFactory <InternalSync>
-    {
-    public:
-        explicit ShaderManager (std::weak_ptr <Core> const& core) :
-            CoreDependent (core)
-        {}
     };
 }
 

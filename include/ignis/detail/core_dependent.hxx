@@ -4,14 +4,31 @@
 #include <memory>
 #include <ignis/graphics/core.hxx>
 
-#include "ignis/graphics/buffer.hxx"
-
 namespace Ignis::Detail
 {
     class CoreDependent
     {
+        template <class Ty, class... RestTys>
+        [[nodiscard]] std::shared_ptr <Graphics::Core> get_common_core (
+            Ty const& dependent,
+            RestTys const&... rest)
+        {
+            std::shared_ptr <Graphics::Core> core { dependent.get_core() };
+
+            if constexpr (sizeof...(RestTys) == 0)
+                return core;
+
+            else {
+                if (core == get_common_core (rest...)) [[likely]]
+                    return core;
+                else
+                    throw std::invalid_argument ("Dependents have different cores");
+            }
+        }
+
     protected:
         CoreDependent () noexcept {
+            /* implicit initialization as a virtual base is not allowed */
             std::terminate();
         }
 
@@ -19,32 +36,64 @@ namespace Ignis::Detail
             myCore (core)
         {}
 
+        template <std::derived_from <CoreDependent>... Tys>
+            requires (sizeof... (Tys) > 1)
+        explicit CoreDependent (Tys const&... dependents) :
+            myCore (get_common_core (dependents...))
+        {}
+
     public:
+        CoreDependent (CoreDependent&&) noexcept = default;
+        CoreDependent (CoreDependent const&) noexcept = default;
+
+        CoreDependent& operator=(CoreDependent&&) noexcept = default;
+        CoreDependent& operator=(CoreDependent const&) noexcept = default;
+
         [[nodiscard]] std::weak_ptr <Graphics::Core>
         get_core() const noexcept {
             return myCore;
         }
 
     protected:
-        void assert_creation_thread () const noexcept {
-            myCore->assert_creation_thread();
-        }
+        std::shared_ptr <Graphics::Core> myCore;
+    };
 
-        [[nodiscard]] uint32_t
-        assert_passthrough_frames_number (uint32_t const frames) const
-        {
-            if (auto const capabilities = myCore->myPhysicalDevice.getSurfaceCapabilitiesKHR (myCore->mySurface);
-                frames < capabilities.minImageCount || frames > capabilities.maxImageCount)
-                [[unlikely]]
-                    throw std::runtime_error("Unsupported frames number");
-
-            return frames;
-        }
+    class VulkanApiDependent :
+        public virtual CoreDependent
+    {
+    protected:
+        VulkanApiDependent () noexcept = default;
 
         [[nodiscard]] vk::raii::Instance const&
-        get_instance() const noexcept {
+        get_instance () const {
             return myCore->myInstance;
         }
+
+        [[nodiscard]] vk::raii::detail::InstanceDispatcher const&
+        get_instance_dispatcher () const {
+            return *myCore->myInstance.getDispatcher();
+        }
+
+        [[nodiscard]] vk::raii::detail::DeviceDispatcher const&
+        get_device_dispatcher () const {
+            return *myCore->myDevice.getDispatcher();
+        }
+
+        [[nodiscard]] vk::raii::detail::ContextDispatcher const&
+        get_context_dispatcher () const {
+            return *myCore->myContext.getDispatcher();
+        }
+
+        [[nodiscard]] uint32_t get_vulkan_version () const noexcept {
+            return myCore->get_vulkan_version();
+        }
+    };
+
+    class DeviceDependent :
+        public virtual CoreDependent
+    {
+    protected:
+        DeviceDependent () noexcept = default;
 
         [[nodiscard]] vk::raii::PhysicalDevice const&
         get_physical_device() const noexcept {
@@ -65,29 +114,6 @@ namespace Ignis::Detail
         get_surface () const noexcept {
             return *myCore->mySurface;
         }
-
-        [[nodiscard]] vk::raii::detail::DeviceDispatcher const&
-        get_device_dispatcher () const {
-            return *myCore->myDevice.getDispatcher();
-        }
-
-        [[nodiscard]] vk::raii::detail::InstanceDispatcher const&
-        get_instance_dispatcher () const {
-            return *myCore->myInstance.getDispatcher();
-        }
-
-        [[nodiscard]] vk::raii::detail::ContextDispatcher const&
-        get_context_dispatcher () const {
-            return *myCore->myContext.getDispatcher();
-        }
-
-        [[nodiscard]] uint32_t
-        get_vulkan_version () const {
-            return myCore->get_vulkan_version();
-        }
-
-    private:
-        std::shared_ptr <Graphics::Core> myCore;
     };
 }
 

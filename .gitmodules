@@ -1,3 +1,0 @@
-[submodule "VulkanMemoryAllocator-Hpp"]
-	path = extern/VulkanMemoryAllocator-Hpp
-	url = https://github.com/YaaZ/VulkanMemoryAllocator-Hpp.git

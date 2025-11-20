@@ -12,10 +12,10 @@
 
 namespace Ignis::Detail
 {
-    class GLFWAloneLock
+    class GLFWSolitudeLock
     {
     protected:
-        GLFWAloneLock() noexcept
+        GLFWSolitudeLock() noexcept
         {
             bool exists = false;
             bool const registered = does_exist.compare_exchange_strong (exists, true,
@@ -24,23 +24,23 @@ namespace Ignis::Detail
             assert (!exists && registered);
         }
 
-        ~GLFWAloneLock() noexcept {
+        ~GLFWSolitudeLock() noexcept {
             does_exist.store (false, std::memory_order_release);
         }
 
     public:
-        GLFWAloneLock (GLFWAloneLock &&) = delete;
-        GLFWAloneLock (GLFWAloneLock const&) = delete;
+        GLFWSolitudeLock (GLFWSolitudeLock &&) = delete;
+        GLFWSolitudeLock (GLFWSolitudeLock const&) = delete;
 
-        GLFWAloneLock& operator=(GLFWAloneLock &&) = delete;
-        GLFWAloneLock& operator=(GLFWAloneLock const&) = delete;
+        GLFWSolitudeLock& operator=(GLFWSolitudeLock &&) = delete;
+        GLFWSolitudeLock& operator=(GLFWSolitudeLock const&) = delete;
 
     private:
         static inline std::atomic_bool does_exist = false;
     };
 
     class GLFWContext final :
-        private GLFWAloneLock,
+        private GLFWSolitudeLock,
         public CreationThreadAsserter
     {
     public:

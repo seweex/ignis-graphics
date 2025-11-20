@@ -1,6 +1,9 @@
-#ifndef IGNIS_DETAIL_SWAPCHAIN_MANAGER_HXX
-#define IGNIS_DETAIL_SWAPCHAIN_MANAGER_HXX
+#ifndef IGNIS_DETAIL_SWAPCHAIN_HXX
+#define IGNIS_DETAIL_SWAPCHAIN_HXX
 
+#include <memory>
+
+#include <boost/container/small_vector.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
 #include <ignis/detail/core_dependent.hxx>
@@ -10,27 +13,24 @@ namespace Ignis::Detail
 {
     struct ImageProperties
     {
-        vk::Format colorFormat;
+        vk::Format format;
         vk::ColorSpaceKHR colorSpace;
-
-        vk::Format depthFormat;
-        vk::PresentModeKHR presentMode;
 
         uint32_t images;
         vk::Extent2D extent;
+        vk::PresentModeKHR presentMode;
     };
 
-    class SwapchainManager :
-        public virtual CoreDependent,
-        public virtual SchedulerBase
+    class Swapchain final :
+        public CreationThreadAsserter,
+        public DeviceDependent
     {
-        [[nodiscard]] static vk::PresentModeKHR
-        pick_present_mode (
-            vk::raii::PhysicalDevice const& physicalDevice,
-            vk::SurfaceKHR const surface,
-            uint32_t const frames,
-            bool const vsync)
+        [[nodiscard]] vk::PresentModeKHR
+        pick_present_mode (uint32_t const frames, bool const vsync) const
         {
+            auto const& physicalDevice = DeviceDependent::get_physical_device();
+            auto const surface = DeviceDependent::get_surface();
+
             auto const desiredModes =
                 std::invoke ([&] () -> boost::container::small_vector <vk::PresentModeKHR, 4>
                 {
@@ -63,11 +63,12 @@ namespace Ignis::Detail
             throw std::runtime_error("No suitable present modes are supported");
         }
 
-        [[nodiscard]] static std::pair <vk::Format, vk::ColorSpaceKHR>
-        pick_color_format (
-            vk::raii::PhysicalDevice const& physicalDevice,
-            vk::SurfaceKHR const surface)
+        [[nodiscard]] std::pair <vk::Format, vk::ColorSpaceKHR>
+        pick_format () const
         {
+            auto const& physicalDevice = DeviceDependent::get_physical_device();
+            auto const surface = DeviceDependent::get_surface();
+
             boost::container::small_vector <vk::Format, 15> srgbFormats;
 
             for (auto const [surfaceFormat, surfaceColorSpace] : physicalDevice.getSurfaceFormatsKHR (surface))
@@ -82,69 +83,53 @@ namespace Ignis::Detail
             };
 
             for (auto const desiredFormat : desiredFormats)
+            {
+                if (!(physicalDevice.getFormatProperties (desiredFormat).optimalTilingFeatures &
+                    vk::FormatFeatureFlagBits::eColorAttachment)) [[unlikely]]
+                    continue;
+
                 if (auto const iter = std::ranges::find (srgbFormats, desiredFormat);
                     iter != srgbFormats.end())
                     return std::make_pair (desiredFormat, vk::ColorSpaceKHR::eSrgbNonlinear);
+            }
 
             throw std::runtime_error("No suitable color format found");
         }
 
-        [[nodiscard]] static vk::Format
-        pick_depth_format (vk::raii::PhysicalDevice const& physicalDevice)
+        [[nodiscard]] vk::Extent2D
+        get_extent () const
         {
-            std::array constexpr desiredFormats = {
-                vk::Format::eD32Sfloat,
-                vk::Format::eD32SfloatS8Uint,
-                vk::Format::eX8D24UnormPack32,
-                vk::Format::eD16Unorm,
-                vk::Format::eD24UnormS8Uint,
-                vk::Format::eD16UnormS8Uint
-            };
+            auto const& physicalDevice = DeviceDependent::get_physical_device();
+            auto const surface = DeviceDependent::get_surface();
 
-            for (auto const desiredFormat : desiredFormats)
-                if (physicalDevice.getFormatProperties (desiredFormat).optimalTilingFeatures
-                    & vk::FormatFeatureFlagBits::eDepthStencilAttachment)
-                    return desiredFormat;
-
-            throw std::runtime_error("No suitable depth format found");
-        }
-
-        [[nodiscard]] static vk::Extent2D
-        get_extent (
-            vk::raii::PhysicalDevice const& physicalDevice,
-            vk::SurfaceKHR const surface)
-        {
             auto const capabilities = physicalDevice.getSurfaceCapabilitiesKHR (surface);
             return capabilities.currentExtent;
         }
 
-        [[nodiscard]] static ImageProperties
-        pick_properties (
-            vk::raii::PhysicalDevice const& physicalDevice,
-            vk::SurfaceKHR const surface,
-            uint32_t const frames,
-            bool const vsync)
+        [[nodiscard]] ImageProperties
+        pick_properties (uint32_t const frames, bool const vsync) const
         {
-            auto const [colorFormat, colorSpace] = pick_color_format (physicalDevice, surface);
+            auto const [colorFormat, colorSpace] = pick_format ();
+
+            auto const extent = get_extent();
+            auto const presentMode = pick_present_mode (frames, vsync);
 
             return {
                 colorFormat,
                 colorSpace,
-                pick_depth_format (physicalDevice),
-                pick_present_mode (physicalDevice, surface, frames, vsync),
                 frames,
-                get_extent (physicalDevice, surface)
+                extent,
+                presentMode
             };
         }
 
-        [[nodiscard]] static vk::raii::SwapchainKHR
-        make_swapchain (
-            vk::raii::Device const& device,
-            vk::SurfaceKHR const surface,
-            QueueIndices const families,
-            ImageProperties const& properties,
-            vk::SwapchainKHR const old = VK_NULL_HANDLE)
+        [[nodiscard]] vk::raii::SwapchainKHR
+        make_swapchain (ImageProperties const& properties, vk::SwapchainKHR const old) const
         {
+            auto const& device = DeviceDependent::get_device();
+            auto const surface = DeviceDependent::get_surface();
+            auto const families = DeviceDependent::get_indices().families;
+
             boost::container::small_flat_set <uint32_t, 2> const accessibleFamilies =
                 { families.graphics, families.present };
 
@@ -154,7 +139,7 @@ namespace Ignis::Detail
                 {},
                 surface,
                 properties.images,
-                properties.colorFormat,
+                properties.format,
                 properties.colorSpace,
                 properties.extent,
                 1,
@@ -172,12 +157,12 @@ namespace Ignis::Detail
             return { device, createInfo };
         }
 
-        [[nodiscard]] static boost::container::small_vector <vk::Image, SchedulerBase::images_hint>
-        get_images (vk::raii::SwapchainKHR const& swapchain)
+        [[nodiscard]] boost::container::small_vector <vk::Image, Hints::images_count>
+        get_images (vk::raii::SwapchainKHR const& swapchain) const
         {
             auto const images = swapchain.getImages();
 
-            boost::container::small_vector <vk::Image, SchedulerBase::images_hint> result;
+            boost::container::small_vector <vk::Image, Hints::images_count> result;
             result.reserve (images.size());
 
             for (auto const image : images)
@@ -186,20 +171,19 @@ namespace Ignis::Detail
             return result;
         }
 
-        [[nodiscard]] static boost::container::small_vector <vk::raii::ImageView, SchedulerBase::images_hint>
-        make_views (
-            vk::raii::Device const& device,
-            ImageProperties const& properties,
-            auto const& images)
+        [[nodiscard]] boost::container::small_vector <vk::raii::ImageView, Hints::images_count>
+        make_views (ImageProperties const& properties, auto const& images) const
         {
-            boost::container::small_vector <vk::raii::ImageView, SchedulerBase::images_hint> result;
+            auto const& device = DeviceDependent::get_device();
+
+            boost::container::small_vector <vk::raii::ImageView, Hints::images_count> result;
             result.reserve (images.size());
 
             vk::ImageViewCreateInfo createInfo {
                 {},
                 VK_NULL_HANDLE,
                 vk::ImageViewType::e2D,
-                properties.colorFormat,
+                properties.format,
                 {
                     vk::ComponentSwizzle::eIdentity,
                     vk::ComponentSwizzle::eIdentity,
@@ -216,46 +200,84 @@ namespace Ignis::Detail
 
             return result;
         }
-    
-    protected:
-        SwapchainManager (uint32_t const frames, bool const vsync)
-        :        
-            myProperties (pick_properties (CoreDependent::get_physical_device(),
-                CoreDependent::get_surface(), frames, vsync)),
 
-            mySwapchain (make_swapchain (CoreDependent::get_device(), CoreDependent::get_surface(),
-                CoreDependent::get_indices().families, myProperties)),
-
+    public:
+        Swapchain (
+            std::weak_ptr <Graphics::Core> const& core,
+            uint32_t const frames,
+            bool const vsync,
+            vk::SwapchainKHR const oldSwapchain = VK_NULL_HANDLE)
+        :
+            CoreDependent (core),
+            myProperties (pick_properties (frames, vsync)),
+            mySwapchain (make_swapchain (myProperties, oldSwapchain)),
             myImages (get_images (mySwapchain)),
-            myViews  (make_views (CoreDependent::get_device(), myProperties, myImages))
+            myViews (make_views (myProperties, myImages))
         {}
 
-        [[nodiscard]] ImageProperties
-        get_image_properties() const noexcept {
-            return myProperties;
+        Swapchain (Swapchain&&) noexcept = default;
+        Swapchain (Swapchain const&) = delete;
+
+        Swapchain& operator=(Swapchain const&) = delete;
+
+        Swapchain& operator=(Swapchain&& other) noexcept
+        {
+            if (this == &other) [[unlikely]]
+                return *this;
+
+            reset();
+
+            myProperties = other.myProperties;
+            mySwapchain = std::move (other.mySwapchain);
+            myImages = std::move (other.myImages);
+            myViews = std::move (other.myViews);
+
+            return *this;
         }
 
         [[nodiscard]] vk::SwapchainKHR
         get_swapchain () const noexcept {
+            assert (is_valid());
             return *mySwapchain;
+        }
+
+        [[nodiscard]] vk::ImageView
+        get_view (uint32_t const frame) const noexcept {
+            assert (is_valid());
+            return myViews.at (frame);
+        }
+
+        [[nodiscard]] uint32_t
+        get_images_count () const noexcept {
+            return myProperties.images;
+        }
+
+        [[nodiscard]] vk::Format
+        get_format () const noexcept {
+            return myProperties.format;
         }
 
         [[nodiscard]] uint32_t
         get_next_frame (uint32_t const currentFrame) const noexcept {
+            assert (is_valid());
             return (currentFrame + 1) % myProperties.images;
         }
 
         [[nodiscard]] uint32_t
-        acquire_next_image (uint32_t const nextFrame)
+        acquire_next_image (
+            uint32_t const nextFrame,
+            SchedulerBase& scheduler,
+            SyncTools& syncTools)
         {
-            CoreDependent::assert_creation_thread();
+            CreationThreadAsserter::assert_creation_thread();
+            assert (is_valid());
 
             auto constexpr timeout = std::numeric_limits <uint64_t>::max();
 
-            auto const semaphore = SchedulerBase::get_image_available_semaphore (nextFrame);
-            auto const fence = SchedulerBase::get_inflight_fence (nextFrame);
+            auto const semaphore = syncTools.get_image_available_semaphore (nextFrame);
+            auto const fence = syncTools.get_inflight_fence (nextFrame);
 
-            SchedulerBase::wait_fence (fence);
+            scheduler.wait_fence (fence);
 
             auto const [result, nextImage] = mySwapchain.acquireNextImage (timeout, semaphore);
 
@@ -265,38 +287,31 @@ namespace Ignis::Detail
             return nextImage;
         }
 
-        [[nodiscard]] boost::container::small_vector <vk::raii::Framebuffer, SchedulerBase::images_hint>
-        make_framebuffers (vk::RenderPass const renderPass)
+        [[nodiscard]] bool
+        is_valid () const noexcept {
+            return
+                mySwapchain != VK_NULL_HANDLE &&
+                !myImages.empty() &&
+                !myViews.empty();
+        }
+
+        void reset () noexcept
         {
-            boost::container::small_vector <vk::raii::Framebuffer, SchedulerBase::images_hint> framebuffers;
-            framebuffers.reserve (myViews.size());
-
-            auto const& device = CoreDependent::get_device();
-
-            for (auto const& view : myViews)
+            if (is_valid()) [[likely]]
             {
-                vk::FramebufferCreateInfo const createInfo {
-                    {},
-                    renderPass,
-                    1,
-                    &*view,
-                    myProperties.extent.width,
-                    myProperties.extent.height,
-                    1
-                };
+                myViews.clear();
 
-                framebuffers.emplace_back (device, createInfo);
+                myImages.clear();
+                mySwapchain.clear();
             }
-
-            return framebuffers;
         }
 
     private:
         ImageProperties myProperties;
         vk::raii::SwapchainKHR mySwapchain;
 
-        boost::container::small_vector <vk::Image, SchedulerBase::images_hint> myImages;
-        boost::container::small_vector <vk::raii::ImageView, SchedulerBase::images_hint> myViews;
+        boost::container::small_vector <vk::Image, Hints::images_count> myImages;
+        boost::container::small_vector <vk::raii::ImageView, Hints::images_count> myViews;
     };
 }
 

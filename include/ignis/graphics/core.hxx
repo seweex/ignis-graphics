@@ -21,13 +21,19 @@
 
 namespace Ignis::Detail
 {
-    class CoreDependent;
+    class VulkanApiDependent;
+    class DeviceDependent;
 
     enum class FamilyType
     {
         graphics,
         transfer,
-        present
+        present,
+
+#if !NDEBUG
+        first_enum_value = graphics,
+        last_enum_value = present
+#endif
     };
 
     struct QueueIndices
@@ -57,14 +63,17 @@ namespace Ignis
 
 namespace Ignis::Graphics
 {
-    class Window;
-
     class Core final :
-        private Detail::CreationThreadAsserter,
+        public  Detail::CreationThreadAsserter,
         private Detail::GLFWDependent
     {
         static constexpr std::array required_extensions =
             { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+
+        [[nodiscard]] uint32_t
+        get_vulkan_version() const noexcept {
+            return myContext.enumerateInstanceVersion();
+        }
 
         [[nodiscard]] vk::raii::Instance
         make_instance (SoftwareInfo const& application, SoftwareInfo const& engine) const
@@ -72,7 +81,7 @@ namespace Ignis::Graphics
             assert (!application.name.empty());
             assert (!engine.name.empty());
 
-            auto const version = myContext.enumerateInstanceVersion();
+            auto const version = get_vulkan_version();
 
             vk::ApplicationInfo const applicationInfo
             {
@@ -103,7 +112,7 @@ namespace Ignis::Graphics
         }
 
         [[nodiscard]] std::pair <vk::raii::PhysicalDevice, Detail::FamilyAndQueueIndices>
-        pick_physical_device ()
+        pick_physical_device () const
         {
             vk::raii::PhysicalDevices deviceList { myInstance };
 
@@ -344,19 +353,15 @@ namespace Ignis::Graphics
             myInstance (make_instance (application, engine)),
             mySurface  (window.create_surface (myInstance)),
             myPhysicalDevice (VK_NULL_HANDLE),
+            myIndices        (),
             myDevice         (VK_NULL_HANDLE)
         {
-            auto [device, indices] = pick_physical_device ();
+            auto [physicalDevice, indices] = pick_physical_device ();
 
-            myPhysicalDevice = std::move (device);
+            myPhysicalDevice = std::move (physicalDevice);
             myIndices = indices;
 
             myDevice = make_device();
-        }
-
-        [[nodiscard]] uint32_t
-        get_vulkan_version() const noexcept {
-            return myContext.enumerateInstanceVersion();
         }
 
     private:
@@ -370,8 +375,8 @@ namespace Ignis::Graphics
 
         vk::raii::Device myDevice;
 
-        using CreationThreadAsserter::assert_creation_thread;
-        friend class Detail::CoreDependent;
+        friend class Detail::VulkanApiDependent;
+        friend class Detail::DeviceDependent;
     };
 }
 

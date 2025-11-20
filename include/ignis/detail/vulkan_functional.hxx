@@ -6,36 +6,44 @@
 #include <functional>
 
 #include <vulkan/vulkan_raii.hpp>
+#include <vulkan/vulkan_hash.hpp>
 
 namespace Ignis::Detail
 {
 	template <class Ty>
+	concept VulkanHashableHandle = requires (Ty const& handle)
+	{
+		{ std::hash <Ty> {} (handle) } -> std::same_as <size_t>;
+	};
+
+	template <class Ty>
+	concept VulkanRaiiHandle = requires (Ty& handle)
+	{
+		typename Ty::CppType;
+		requires std::convertible_to <Ty, typename Ty::CppType>;
+
+		handle.clear();
+		{ handle.release() } -> std::same_as <typename Ty::CppType>;
+	};
+
+	template <class Ty>
+	concept VulkanUniqueHandle = requires (Ty const& handle)
+	{
+		typename Ty::element_type;
+		{ handle.get() } -> std::same_as <typename Ty::element_type const&>;
+	};
+
+	template <class Ty>
 	class VulkanHandleTraits final
 	{
 	public:
-		using IsRaii = std::bool_constant <
-			requires (Ty& handle)
-			{
-				typename Ty::CppType;
-
-				handle.clear();
-				{ handle.release() } -> std::same_as <typename Ty::CppType>;
-			}>;
-
-		using IsUniqueHandle = std::bool_constant <
-			requires (Ty& handle)
-			{
-				typename Ty::element_type;
-				handle.get();
-			}>;
-
 		[[nodiscard]] static auto
 		get_handle (Ty const& handle) noexcept
 		{
-			if constexpr (IsRaii::value)
+			if constexpr (VulkanRaiiHandle <Ty>)
 				return static_cast <typename Ty::CppType> (handle);
 
-			else if constexpr (IsUniqueHandle::value)
+			else if constexpr (VulkanUniqueHandle <Ty>)
 				return handle.get();
 
 			else
@@ -45,11 +53,15 @@ namespace Ignis::Detail
 		[[nodiscard]] static auto
 		get_native (Ty const& handle) noexcept
 		{
-			if constexpr (IsRaii::value)
-				return static_cast <typename Ty::CType> (*handle);
+			if constexpr (VulkanRaiiHandle <Ty>) {
+				auto const unowningHandle = static_cast <typename Ty::CppType> (handle);
+				return static_cast <typename Ty::CppType::CType> (unowningHandle);
+			}
 
-			else if constexpr (IsUniqueHandle::value)
-				return static_cast <typename Ty::element_type::CType> (handle.get());
+			else if constexpr (VulkanUniqueHandle <Ty>) {
+				auto const unowningHandle = handle.get();
+				return static_cast <typename Ty::element_type::CType> (unowningHandle);
+			}
 
 			else
 				return static_cast <typename Ty::CType> (handle);
@@ -69,12 +81,14 @@ namespace Ignis::Detail
 		template <class Handle>
 		[[nodiscard]] size_t operator() (Handle const& handle) const noexcept
 		{
-			using Traits = VulkanHandleTraits <Handle>;
+			if constexpr (VulkanHashableHandle <Handle>)
+				return std::hash <Handle> {} (handle);
 
-			void const* const native = Traits::get_native (handle);
-			std::hash <void const*> constexpr hasher;
+			else {
+				void const* const native = VulkanHandleTraits <Handle>::get_native (handle);
 
-			return hasher (native);
+				return std::hash <void const*> {} (native);
+			}
 		}
 	};
 
@@ -86,13 +100,18 @@ namespace Ignis::Detail
 		template <class LeftHandle, class RightHandle>
 		[[nodiscard]] bool operator() (LeftHandle const& left, RightHandle const& right) const noexcept
 		{
-			using LeftTraits = VulkanHandleTraits <LeftHandle>;
-			using RightTraits = VulkanHandleTraits <RightHandle>;
+			if constexpr (std::equality_comparable_with <LeftHandle, RightHandle>)
+				return left == right;
 
-			auto const leftHandle = LeftTraits::get_handle (left);
-			auto const rightHandle = RightTraits::get_handle (right);
+			else {
+				using LeftTraits = VulkanHandleTraits <LeftHandle>;
+				using RightTraits = VulkanHandleTraits <RightHandle>;
 
-			return leftHandle == rightHandle;
+				auto const leftHandle = LeftTraits::get_handle (left);
+				auto const rightHandle = RightTraits::get_handle (right);
+
+				return leftHandle == rightHandle;
+			}
 		}
 	};
 }

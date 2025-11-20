@@ -2,20 +2,24 @@
 #define IGNIS_DETAIL_RESOURCE_MEMORY_HXX
 
 #include <vulkan/vulkan_raii.hpp>
+#include <vulkan/vulkan_structs.hpp>
 
 #include <ignis/detail/include_vulkan_allocator.hxx>
+#include <ignis/detail/vulkan_functional.hxx>
+
 #include <ignis/detail/core_dependent.hxx>
 
 namespace Ignis::Graphics
 {
     enum class MemoryAccess
     {
+        unaccessible,
         transfer,
         temporary_mapped,
         constantly_mapped,
 
 #if !NDEBUG
-        first_enum_value = transfer,
+        first_enum_value = unaccessible,
         last_enum_value = constantly_mapped
 #endif
     };
@@ -47,15 +51,12 @@ namespace Ignis::Detail
             myPointer    (allocator.mapMemory (allocation))
         {}
 
-        explicit MemoryMapping (void* const mapped) noexcept :
+        explicit MemoryMapping (void* const mapped)
+        noexcept :
             myAllocator (nullptr),
             myAllocation (nullptr),
             myPointer (mapped)
         {}
-
-        ~MemoryMapping() noexcept {
-            release();
-        }
 
         MemoryMapping (MemoryMapping&& other)
         noexcept :
@@ -81,6 +82,9 @@ namespace Ignis::Detail
         MemoryMapping (MemoryMapping const&) = delete;
         MemoryMapping& operator=(MemoryMapping const&) = delete;
 
+        ~MemoryMapping() noexcept
+        { release(); }
+
         [[nodiscard]] bool owns_mapping () const noexcept {
             return myPointer && myAllocator && myAllocation;
         }
@@ -105,15 +109,22 @@ namespace Ignis::Detail
         void* myPointer;
     };
 
-    class ResourceMemoryAllocator :
-        public virtual CoreDependent
+    class ResourceMemoryAllocator final :
+        public VulkanApiDependent,
+        public DeviceDependent
     {
         [[nodiscard]] vma::UniqueAllocator
         make_allocator () const
         {
-            auto const& deviceDispatcher = CoreDependent::get_device_dispatcher();
-            auto const& instanceDispatcher = CoreDependent::get_instance_dispatcher();
-            auto const& contextDispatcher = CoreDependent::get_context_dispatcher();
+            auto const& instance = VulkanApiDependent::get_instance();
+            auto const version = VulkanApiDependent::get_vulkan_version();
+
+            auto const& deviceDispatcher = VulkanApiDependent::get_device_dispatcher();
+            auto const& instanceDispatcher = VulkanApiDependent::get_instance_dispatcher();
+            auto const& contextDispatcher = VulkanApiDependent::get_context_dispatcher();
+
+            auto const& physicalDevice = DeviceDependent::get_physical_device();
+            auto const& device = DeviceDependent::get_device();
 
             vma::VulkanFunctions const vulkanFunctions
             {
@@ -148,15 +159,15 @@ namespace Ignis::Detail
             vma::AllocatorCreateInfo const createInfo
             {
                 {},
-                CoreDependent::get_physical_device(),
-                CoreDependent::get_device(),
+                physicalDevice,
+                device,
                 {},
                 nullptr,
                 nullptr,
                 nullptr,
                 &vulkanFunctions,
-                CoreDependent::get_instance(),
-                CoreDependent::get_vulkan_version(),
+                instance,
+                version,
                 nullptr
             };
 
@@ -184,37 +195,31 @@ namespace Ignis::Detail
                 return common_flags;
         }
 
-    protected:
-        ResourceMemoryAllocator () :
-            myAllocator (make_allocator())
+        template <Graphics::MemoryPlacement Placement>
+        [[nodiscard]] static constexpr vma::MemoryUsage make_usage_flags () noexcept
+        {
+
+                return {};
+        }
+
+    public:
+        explicit ResourceMemoryAllocator (std::weak_ptr <Graphics::Core> const& core) :
+            CoreDependent (core),
+            myAllocator (make_allocator ())
         {}
+
+        ResourceMemoryAllocator (ResourceMemoryAllocator &&) noexcept = default;
+        ResourceMemoryAllocator (ResourceMemoryAllocator const&) = delete;
+
+        ResourceMemoryAllocator& operator=(ResourceMemoryAllocator &&) noexcept = default;
+        ResourceMemoryAllocator& operator=(ResourceMemoryAllocator const&) = delete;
 
         template <Graphics::MemoryAccess Access,
                   Graphics::MemoryPlacement Placement,
-                  class AllocateForHandle>
-        requires (std::same_as <AllocateForHandle, vk::Buffer> ||
-                  std::same_as <AllocateForHandle, vk::Image>)
-        [[nodiscard]] vma::UniqueAllocation allocate (AllocateForHandle const resourceHandle)
-        {
-            vma::AllocationCreateInfo const allocationInfo {
-                make_allocation_flags <Access> (),
-                {},
-                {},
-                {},
-                {},
-                nullptr,
-                nullptr,
-                1.f
-            };
-
-            if constexpr (std::same_as <AllocateForHandle, vk::Buffer>)
-                return myAllocator->allocateMemoryForBufferUnique (resourceHandle, allocationInfo);
-            else
-                return myAllocator->allocateMemoryForImageUnique (resourceHandle, allocationInfo);
-        }
-
-        template <Graphics::MemoryAccess Access, Graphics::MemoryPlacement Placement>
-        [[nodiscard]] vma::UniqueAllocation allocate (vk::Image const image)
+                  class Handle>
+        requires (std::convertible_to <Handle, vk::Buffer> ||
+                  std::convertible_to <Handle, vk::Image>)
+        [[nodiscard]] vma::UniqueAllocation allocate (Handle const& resourceHandle)
         {
             vma::AllocationCreateInfo const allocationInfo {
                 make_allocation_flags <Access> (),
@@ -227,10 +232,14 @@ namespace Ignis::Detail
                 1.f
             };
 
-            return myAllocator->allocateMemoryForImageUnique (image, allocationInfo);
+            if constexpr (std::convertible_to <Handle, vk::Buffer>)
+                return myAllocator->allocateMemoryForBufferUnique (resourceHandle, allocationInfo);
+            else
+                return myAllocator->allocateMemoryForImageUnique (resourceHandle, allocationInfo);
         }
 
-        [[nodiscard]] vma::Allocator get_allocator() const noexcept {
+        [[nodiscard]] vma::Allocator
+        get_handle () const noexcept {
             return myAllocator.get();
         }
 
@@ -239,26 +248,35 @@ namespace Ignis::Detail
     };
 
     template <bool InternalSync>
-    class ResourceMemoryFactory :
-        public virtual ResourceMemoryAllocator
+    class ResourceMemoryFactory
     {
-    protected:
-        ResourceMemoryFactory () = default;
+    public:
+        ResourceMemoryFactory () noexcept = default;
+
+        ResourceMemoryFactory (ResourceMemoryFactory &&) = delete;
+        ResourceMemoryFactory (ResourceMemoryFactory const&) = delete;
+
+        ResourceMemoryFactory& operator=(ResourceMemoryFactory &&) = delete;
+        ResourceMemoryFactory& operator=(ResourceMemoryFactory const&) = delete;
 
         template <Graphics::MemoryAccess Access,
                   Graphics::MemoryPlacement Placement,
-                  class AllocateForHandle>
-        requires (std::same_as <AllocateForHandle, vk::Buffer> ||
-                  std::same_as <AllocateForHandle, vk::Image>)
-        [[nodiscard]] vma::Allocation make_allocation (AllocateForHandle const resourceHandle)
+                  class Handle>
+        requires (std::convertible_to <Handle, vk::Buffer> ||
+                  std::convertible_to <Handle, vk::Image>)
+        [[nodiscard]] vma::Allocation make_allocation (
+            ResourceMemoryAllocator& allocator,
+            Handle const& resourceHandle)
         {
-            auto allocation = ResourceMemoryAllocator::allocate <Access, Placement> (resourceHandle);
+            auto allocation = allocator.allocate <Access, Placement> (resourceHandle);
 
-            [[maybe_unused]] auto const lock = lock_mutex <InternalSync, std::lock_guard> (myMutex);
-            [[maybe_unused]] auto const [iter, inserted] = myAllocations.emplace (std::move (allocation));
+            [[maybe_unused]] auto const lock =
+                lock_mutex <InternalSync, std::lock_guard> (myMutex);
 
-            auto const allocationHandle = iter->get();
-            return allocationHandle;
+            [[maybe_unused]] auto const [iter, inserted] =
+                myAllocations.emplace (std::move (allocation));
+
+            return iter->get();
         }
 
         void destroy_allocation (vma::Allocation const allocation) noexcept(!InternalSync)
@@ -278,50 +296,44 @@ namespace Ignis::Detail
         myAllocations;
     };
 
-    class ResourceMemoryDispatcher :
-        public virtual ResourceMemoryAllocator
+    class ResourceMemoryManager
     {
-    protected:
-        ResourceMemoryDispatcher () = default;
+    public:
+        ResourceMemoryManager () noexcept = default;
 
         template <class Handle>
         requires (std::same_as <Handle, vk::raii::Buffer> ||
                   std::same_as <Handle, vk::raii::Image>)
-        void bind_to_resource (Handle& resource, vma::Allocation const allocation)
+        void bind_to_resource (
+            vma::Allocator const allocator,
+            vma::Allocation const allocation,
+            Handle& resource) const
         {
-            auto const allocator = ResourceMemoryAllocator::get_allocator();
-            auto const info = allocator.getAllocationInfo(allocation);
-
+            auto const info = allocator.getAllocationInfo (allocation);
             resource.bindMemory (info.deviceMemory, info.offset);
         }
 
-        [[nodiscard]] MemoryMapping
-        map_memory (vma::Allocation const allocation) const
+        void flush_memory (
+            vma::Allocator const allocator,
+            vma::Allocation const allocation,
+            size_t const size,
+            size_t const offset) const
         {
-            auto const allocator = get_allocator();
+            allocator.flushAllocation (allocation, offset, size);
+        }
 
+        [[nodiscard]] MemoryMapping
+        map_memory (
+            vma::Allocator const allocator,
+            vma::Allocation const allocation) const
+        {
             if (auto const info = allocator.getAllocationInfo(allocation);
                 info.pMappedData) [[unlikely]]
                 return MemoryMapping { info.pMappedData };
             else
                 return MemoryMapping { allocator, allocation };
         }
-
-        void flush (
-            vma::Allocation const allocation,
-            size_t const size,
-            size_t const offset) const
-        {
-            auto const allocator = ResourceMemoryAllocator::get_allocator();
-            allocator.flushAllocation (allocation, offset, size);
-        }
     };
-
-    template <bool InternalSync>
-    class ResourceMemoryManager :
-        public virtual ResourceMemoryFactory <InternalSync>,
-        public virtual ResourceMemoryDispatcher
-    {};
 }
 
 #endif

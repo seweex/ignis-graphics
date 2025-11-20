@@ -2,245 +2,46 @@
 #define IGNIS_DETAIL_SCHEDULER_HXX
 
 #include <boost/container/small_vector.hpp>
-#include <boost/unordered/unordered_flat_map.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
 #include <ignis/detail/core_dependent.hxx>
 #include <ignis/detail/enable_sync.hxx>
 
+#include <ignis/detail/hints.hxx>
+#include <ignis/detail/sync_tools.hxx>
+#include <ignis/detail/double_command_buffer.hxx>
+
 namespace Ignis::Detail
 {
-    template <bool InternalSync>
-    class PendingExecutionBuffers;
-
-    template <bool InternalSync>
-    class CommandPools;
-
-    template <>
-    class PendingExecutionBuffers <true>
+    class SchedulerBase :
+        public virtual DeviceDependent
     {
+    protected:
+        SchedulerBase () noexcept = default;
+
     public:
-        void postpone_commands (vk::raii::CommandBuffer&& buffer)
+        SchedulerBase (SchedulerBase &&) noexcept = default;
+        SchedulerBase (SchedulerBase const&) = delete;
+
+        SchedulerBase& operator=(SchedulerBase &&) noexcept = default;
+        SchedulerBase& operator=(SchedulerBase const&) = delete;
+
+    protected:
+        [[nodiscard]] vk::raii::CommandPool
+        make_pool (uint32_t const family) const
         {
-            std::lock_guard lock { myPendingMutex };
+            auto const& device = DeviceDependent::get_device();
 
-            myPendingBuffers.reserve (myPendingBuffers.size() + 1);
-            myPendingHandles.reserve (myPendingHandles.size() + 1);
-
-            vk::CommandBuffer const handle = myPendingBuffers.emplace_back (std::move (buffer));
-            myPendingHandles.emplace_back (handle);
-        }
-
-        void begin_execution ()
-        {
-            myExecutingHandles.clear();
-            myExecutingBuffers.clear();
-
-            {
-                std::lock_guard lock { myPendingMutex };
-
-                myExecutingBuffers.swap (myPendingBuffers);
-                myExecutingHandles.swap (myPendingHandles);
-            }
-        }
-
-        [[nodiscard]] std::span <vk::CommandBuffer const>
-        get_executing_handles () const noexcept {
-            return { myExecutingHandles.data(), myExecutingHandles.size() };
-        }
-
-        [[nodiscard]] bool empty() const noexcept {
-            return myExecutingBuffers.empty();
-        }
-
-    private:
-        std::mutex myPendingMutex;
-
-        struct alignas(64) {
-            std::vector <vk::raii::CommandBuffer> myPendingBuffers;
-            std::vector <vk::CommandBuffer> myPendingHandles;
-        };
-
-        std::vector <vk::raii::CommandBuffer> myExecutingBuffers;
-        std::vector <vk::CommandBuffer> myExecutingHandles;
-    };
-
-    template <>
-    class PendingExecutionBuffers <false>
-    {
-    public:
-        void postpone_commands (vk::raii::CommandBuffer&& buffer)
-        {
-            myBuffers.reserve (myBuffers.size() + 1);
-            myHandles.reserve (myHandles.size() + 1);
-
-            vk::CommandBuffer const handle = myBuffers.emplace_back (std::move (buffer));
-            myHandles.emplace_back (handle);
-        }
-
-        void begin_execution () noexcept {}
-
-        [[nodiscard]] std::span <vk::CommandBuffer const>
-        get_executing_handles () const noexcept {
-            return { myHandles.data(), myHandles.size() };
-        }
-
-        [[nodiscard]] bool empty() const noexcept {
-            return myBuffers.empty();
-        }
-
-    private:
-        std::vector <vk::raii::CommandBuffer> myBuffers;
-        std::vector <vk::CommandBuffer> myHandles;
-    };
-
-    template <>
-    class CommandPools <true>
-    {
-        static thread_local auto const inline this_thread_id = std::this_thread::get_id();
-
-        [[nodiscard]] std::optional <vk::CommandPool>
-        find_pool () const noexcept
-        {
-            std::shared_lock lock { myMutex };
-
-            if (auto const iter = myPools.find (this_thread_id);
-                iter != myPools.end()) [[likely]]
-                return iter->second;
-            else
-                return std::nullopt;
-        }
-
-        [[nodiscard]] vk::CommandPool
-        emplace_pool ()
-        {
             vk::CommandPoolCreateInfo const createInfo
-                { vk::CommandPoolCreateFlagBits::eTransient, myFamily };
-
-            vk::raii::CommandPool pool { myDevice, createInfo };
-
-            std::unique_lock lock { myMutex };
-            return myPools.emplace (this_thread_id, std::move (pool)).first->second;
-        }
-
-    public:
-        CommandPools (vk::raii::Device& device, uint32_t const family)
-        noexcept :
-            myDevice (device),
-            myFamily (family)
-        {}
-
-        CommandPools (CommandPools &&) = delete;
-        CommandPools (CommandPools const&) = delete;
-
-        CommandPools& operator=(CommandPools &&) = delete;
-        CommandPools& operator=(CommandPools const&) = delete;
-
-        [[nodiscard]] vk::CommandPool
-        acquire_pool ()
-        {
-            if (auto const pool = find_pool();
-                pool.has_value()) [[likely]]
-                return *pool;
-            else
-                return emplace_pool ();
-        }
-
-    private:
-        vk::raii::Device& myDevice;
-        uint32_t myFamily;
-
-        std::shared_mutex mutable myMutex;
-
-        alignas (64) boost::unordered::unordered_flat_map
-            <std::thread::id, vk::raii::CommandPool, std::hash <std::thread::id>>
-        myPools;
-    };
-
-    template <>
-    class CommandPools <false>
-    {
-        [[nodiscard]] static vk::raii::CommandPool
-        make_command_pool (vk::raii::Device& device, uint32_t const family)
-        {
-            vk::CommandPoolCreateInfo const createInfo
-                { vk::CommandPoolCreateFlagBits::eTransient, family };
+                { vk::CommandPoolCreateFlagBits::eResetCommandBuffer, family };
 
             return { device, createInfo };
         }
 
-    public:
-        CommandPools (vk::raii::Device& device, uint32_t const family) :
-            myPool (make_command_pool (device, family))
-        {}
-
-        [[nodiscard]] vk::CommandPool
-        acquire_pool () noexcept {
-           return myPool;
-        }
-
-    private:
-        vk::raii::CommandPool myPool;
-    };
-
-    class SchedulerBase :
-        public virtual CoreDependent
-    {
-    protected:
-        static constexpr size_t images_hint = 3;
-
-    private:
-        static constexpr uint64_t wait_timeout = std::numeric_limits <uint64_t>::max();
-
-        [[nodiscard]] boost::container::small_vector <vk::raii::Semaphore, images_hint>
-        make_semaphores (uint32_t const count) const
-        {
-            boost::container::small_vector <vk::raii::Semaphore, images_hint> semaphores;
-            semaphores.reserve(count);
-
-            vk::SemaphoreCreateInfo constexpr createInfo;
-
-            for (uint32_t i = 0; i < count; ++i)
-                semaphores.emplace_back (CoreDependent::get_device(), createInfo);
-
-            return semaphores;
-        }
-
-        [[nodiscard]] boost::container::small_vector <vk::raii::Fence, images_hint>
-        make_fences (uint32_t const count) const
-        {
-            boost::container::small_vector <vk::raii::Fence, images_hint> fences;
-            fences.reserve(count);
-
-            vk::FenceCreateInfo constexpr createInfo
-                { vk::FenceCreateFlagBits::eSignaled };
-
-            for (uint32_t i = 0; i < count; ++i)
-                fences.emplace_back (CoreDependent::get_device(), createInfo);
-
-            return fences;
-        }
-
-    public:
-        SchedulerBase () noexcept {
-            std::terminate();
-        }
-
-    protected:
-        explicit SchedulerBase (uint32_t const frames)
-        :
-            myImageAvailableSemaphores    (make_semaphores (frames)),
-            myRenderCompletedSemaphores   (make_semaphores (frames)),
-            myTransferCompletedSemaphores (make_semaphores (frames)),
-
-            myInFlightFences (make_fences (frames)),
-            myGraphicsWaitsTransfer (false)
-        {}
-
         [[nodiscard]] vk::raii::CommandBuffer
         make_command_buffer (vk::CommandPool const pool) const
         {
-            auto const& device = CoreDependent::get_device();
+            auto const& device = DeviceDependent::get_device();
 
             vk::CommandBufferAllocateInfo const allocateInfo
                 { pool, vk::CommandBufferLevel::ePrimary, 1 };
@@ -249,127 +50,188 @@ namespace Ignis::Detail
             return std::move (buffers.front());
         }
 
-        [[nodiscard]] vk::Semaphore
-        get_image_available_semaphore (uint32_t const frame) {
-            return myImageAvailableSemaphores.at(frame);
-        }
-
-        [[nodiscard]] vk::Semaphore
-        get_render_completed_semaphore (uint32_t const frame) {
-            return myRenderCompletedSemaphores.at(frame);
-        }
-
-        [[nodiscard]] vk::Semaphore
-        get_transfer_completed_semaphore (uint32_t const frame) {
-            return myTransferCompletedSemaphores.at(frame);
-        }
-
-        [[nodiscard]] vk::Fence
-        get_inflight_fence (uint32_t const frame) {
-            return myInFlightFences.at(frame);
-        }
-
+    public:
         void wait_fence (vk::Fence const fence) const
         {
-            auto& device = CoreDependent::get_device();
+            auto& device = DeviceDependent::get_device();
 
-            if (auto const result = device.waitForFences({ 1, &fence }, true, wait_timeout);
+            if (auto const result = device.waitForFences({ 1, &fence }, true, Hints::wait_timeout);
                 result != vk::Result::eSuccess) [[unlikely]]
                 throw std::runtime_error ("Failed to wait for fence");
 
             device.resetFences({ 1, &fence });
         }
-
-        void ask_for_waiting_for_transfer () noexcept {
-            myGraphicsWaitsTransfer.store (true, std::memory_order_release);
-        }
-
-        [[nodiscard]] bool take_transfer_pause_flag () noexcept
-        {
-            bool shouldWait = true;
-            bool const flagTaken = myGraphicsWaitsTransfer.compare_exchange_strong (shouldWait, false,
-                std::memory_order_acq_rel, std::memory_order_acquire);
-
-            return shouldWait && flagTaken;
-        }
-
-    private:
-        alignas (64) boost::container::small_vector <vk::raii::Semaphore, images_hint>
-        myImageAvailableSemaphores;
-
-        alignas (64) boost::container::small_vector <vk::raii::Semaphore, images_hint>
-        myRenderCompletedSemaphores;
-
-        alignas (64) boost::container::small_vector <vk::raii::Semaphore, images_hint>
-        myTransferCompletedSemaphores;
-
-        alignas (64) boost::container::small_vector <vk::raii::Fence, images_hint>
-        myInFlightFences;
-
-        std::atomic_bool myGraphicsWaitsTransfer;
     };
 
     template <bool InternalSync>
     class GraphicsScheduler :
+        public virtual CreationThreadAsserter,
         public virtual SchedulerBase
     {
-    protected:
-        explicit GraphicsScheduler (uint32_t const frames)
+        [[nodiscard]] boost::container::small_vector <vk::raii::CommandBuffer, Hints::images_count>
+        make_frames_command_buffers (uint32_t const frames) const
+        {
+            boost::container::small_vector <vk::raii::CommandBuffer, Hints::images_count> buffers;
+            buffers.reserve (frames);
+
+            for (uint32_t i = 0; i < frames; ++i)
+                buffers.emplace_back (SchedulerBase::make_command_buffer (*myPool));
+
+            return buffers;
+        }
+
+    public:
+        GraphicsScheduler (std::weak_ptr<Graphics::Core> const& core, uint32_t const frames)
         :
-            SchedulerBase (frames),
+            CoreDependent (core),
 
-            myQueue (CoreDependent::get_device().getQueue(
-                CoreDependent::get_indices().families.graphics,
-                CoreDependent::get_indices().queues.graphics)),
+            myQueue (DeviceDependent::get_device().getQueue(
+                DeviceDependent::get_indices().families.graphics,
+                DeviceDependent::get_indices().queues.graphics)),
 
-            myPools (CoreDependent::get_device(), CoreDependent::get_indices().families.graphics),
-            myFrameCommands (frames)
+            myPool (make_pool (DeviceDependent::get_indices().families.graphics)),
+            myBuffers (make_frames_command_buffers (frames))
         {}
 
-        [[nodiscard]] vk::raii::CommandBuffer
-        make_graphics_command_buffers () {
-            auto const pool = myPools.acquire_pool();
-            return SchedulerBase::make_command_buffer (pool);
+        GraphicsScheduler (GraphicsScheduler&&) = delete;
+        GraphicsScheduler (GraphicsScheduler const&) = delete;
+
+        GraphicsScheduler& operator=(GraphicsScheduler&&) = delete;
+        GraphicsScheduler& operator=(GraphicsScheduler const&) = delete;
+
+        [[nodiscard]] std::pair <vk::raii::CommandBuffer&,
+            std::conditional_t <InternalSync, std::unique_lock <std::mutex>, LockMock>>
+        get_graphics_command_buffer (uint32_t const frame)
+        {
+            auto& buffer = myBuffers.at (frame);
+            auto lock = lock_mutex <InternalSync, std::unique_lock> (myBuffersMutex);
+
+            return { buffer, std::move (lock) };
         }
 
-        void postpone_graphics_commands (
-            vk::raii::CommandBuffer&& commands, uint32_t const frame)
+        void execute_graphics (uint32_t const frame, SyncTools& syncTools)
         {
-            auto& buffers = myFrameCommands.at(frame);
-            buffers.postpone_commands (std::move (commands));
-        }
+            CreationThreadAsserter::assert_creation_thread();
+            assert (syncTools.is_valid());
 
-        void submit_graphics_commands (uint32_t const frame)
-        {
-            auto& buffers = myFrameCommands.at(frame);
-            buffers.begin_execution();
+            auto const transferFence = syncTools.get_transfer_fence (frame);
+            auto const inflightFence = syncTools.get_inflight_fence (frame);
 
-            assert (!buffers.empty());
-
-            auto const commands = buffers.get_executing_handles();
-            auto const fence = SchedulerBase::get_inflight_fence (frame);
-
-            std::array const waitSemaphores = {
-                SchedulerBase::get_image_available_semaphore (frame),
-                SchedulerBase::get_transfer_completed_semaphore (frame)
-            };
-
-            std::array constexpr waitStages = {
+            std::array <vk::PipelineStageFlags, 2>
+            constexpr waitStages = {
                 vk::PipelineStageFlagBits::eColorAttachmentOutput,
                 vk::PipelineStageFlagBits::eTransfer
             };
 
-            std::array const signalSemaphores =
-                { SchedulerBase::get_render_completed_semaphore (frame) };
+            std::array const waitSemaphores = {
+                syncTools.get_image_available_semaphore (frame),
+                syncTools.get_transfer_completed_semaphore (frame)
+            };
 
-            vk::SubmitInfo const submitInfo
-            {
-                static_cast <uint32_t> (waitSemaphores.size()),
+            std::array const signalSemaphores = {
+                syncTools.get_render_completed_semaphore (frame)
+            };
+
+            [[maybe_unused]] auto const lock =
+                lock_mutex <InternalSync, std::unique_lock> (myBuffersMutex);
+
+            auto const buffer = *myBuffers.at (frame);
+
+            vk::SubmitInfo const submitInfo {
+                static_cast<uint32_t>(waitSemaphores.size()),
                 waitSemaphores.data(),
                 waitStages.data(),
-                static_cast <uint32_t> (commands.size()),
-                commands.data(),
-                static_cast <uint32_t> (signalSemaphores.size()),
+                1, &buffer,
+                static_cast<uint32_t>(signalSemaphores.size()),
+                signalSemaphores.data()
+            };
+
+            SchedulerBase::wait_fence (transferFence);
+            myQueue.submit ({ 1, &submitInfo }, inflightFence);
+        }
+
+    private:
+        vk::raii::Queue myQueue;
+        vk::raii::CommandPool myPool;
+
+        [[no_unique_address]] EnableMutex <InternalSync, std::mutex> myBuffersMutex;
+
+        boost::container::small_vector
+            <vk::raii::CommandBuffer, Hints::images_count>
+        myBuffers;
+    };
+
+    template <bool InternalSync>
+    class TransferScheduler :
+        public virtual CreationThreadAsserter,
+        public virtual SchedulerBase
+    {
+        explicit TransferScheduler (
+            std::weak_ptr<Graphics::Core> const& core,
+            [[maybe_unused]] std::true_type const initializeMultithread)
+        requires (InternalSync) :
+            CoreDependent (core),
+
+            myQueue (DeviceDependent::get_device().getQueue(
+                DeviceDependent::get_indices().families.transfer,
+                DeviceDependent::get_indices().queues.transfer)),
+
+            myPool (SchedulerBase::make_pool (DeviceDependent::get_indices().families.transfer)),
+
+            myCommandBuffers (
+                SchedulerBase::make_command_buffer (*myPool),
+                SchedulerBase::make_command_buffer (*myPool))
+        {}
+
+        explicit TransferScheduler (
+            std::weak_ptr<Graphics::Core> const& core,
+            [[maybe_unused]] std::false_type const initializeMultithread)
+        requires (!InternalSync) :
+            CoreDependent (core),
+
+            myQueue (DeviceDependent::get_device().getQueue(
+                DeviceDependent::get_indices().families.transfer,
+                DeviceDependent::get_indices().queues.transfer)),
+
+            myPool (SchedulerBase::make_pool (DeviceDependent::get_indices().families.transfer)),
+            myCommandBuffers (SchedulerBase::make_command_buffer (*myPool))
+        {}
+
+    public:
+        explicit TransferScheduler (std::weak_ptr<Graphics::Core> const& core) :
+            TransferScheduler (core, std::bool_constant <InternalSync>{})
+        {}
+
+        TransferScheduler (TransferScheduler &&) = delete;
+        TransferScheduler (TransferScheduler const&) = delete;
+
+        TransferScheduler& operator=(TransferScheduler &&) = delete;
+        TransferScheduler& operator=(TransferScheduler const&) = delete;
+
+        [[nodiscard]] auto get_transfer_command_buffer () {
+            return myCommandBuffers.get_for_writing ();
+        }
+
+        void execute_transfer (uint32_t const frame, SyncTools& syncTools)
+        {
+            CreationThreadAsserter::assert_creation_thread();
+            assert (syncTools.is_valid());
+
+            std::array <vk::PipelineStageFlags, 1>
+            constexpr waitStages = { vk::PipelineStageFlagBits::eColorAttachmentOutput };
+
+            std::array const waitSemaphores = { syncTools.get_render_completed_semaphore (frame) };
+            std::array const signalSemaphores = { syncTools.get_transfer_completed_semaphore (frame) };
+
+            auto const fence = syncTools.get_transfer_fence (frame);
+            auto const [buffer, lock] = myCommandBuffers.get_for_execution ();
+
+            vk::SubmitInfo const submitInfo {
+                static_cast<uint32_t>(waitSemaphores.size()),
+                waitSemaphores.data(),
+                waitStages.data(),
+                1, &buffer,
+                static_cast<uint32_t>(signalSemaphores.size()),
                 signalSemaphores.data()
             };
 
@@ -378,83 +240,40 @@ namespace Ignis::Detail
 
     private:
         vk::raii::Queue myQueue;
+        vk::raii::CommandPool myPool;
 
-        CommandPools <InternalSync> myPools;
-
-        boost::container::small_vector <PendingExecutionBuffers <InternalSync>, SchedulerBase::images_hint>
-        myFrameCommands;
-    };
-
-    template <bool InternalSync>
-    class TransferScheduler :
-        public virtual SchedulerBase
-    {
-    protected:
-        TransferScheduler ()
-        :
-            myQueue (CoreDependent::get_device().getQueue(
-                CoreDependent::get_indices().families.transfer,
-                CoreDependent::get_indices().queues.transfer)),
-
-            myPools (CoreDependent::get_device(), CoreDependent::get_indices().families.transfer)
-        {}
-
-        [[nodiscard]] vk::raii::CommandBuffer
-        make_transfer_command_buffers () {
-            auto const pool = myPools.acquire_pool();
-            return SchedulerBase::make_command_buffer (pool);
-        }
-
-        void postpone_transfer_commands (vk::raii::CommandBuffer&& commands) {
-            myCommands.postpone_commands (std::move (commands));
-        }
-
-        void submit_transfer_commands (uint32_t const frame)
-        {
-            myCommands.begin_execution();
-            assert (!myCommands.empty());
-
-            auto const commands = myCommands.get_executing_handles();
-
-            std::array const signalSemaphores =
-                { SchedulerBase::get_transfer_completed_semaphore (frame) };
-
-            vk::SubmitInfo const submitInfo
-            {
-                0, nullptr,
-                nullptr,
-                static_cast <uint32_t> (commands.size()),
-                commands.data(),
-                static_cast <uint32_t> (signalSemaphores.size()),
-                signalSemaphores.data()
-            };
-
-            myQueue.submit ({ 1, &submitInfo });
-        }
-
-    private:
-        vk::raii::Queue myQueue;
-
-        CommandPools <InternalSync> myPools;
-        PendingExecutionBuffers <InternalSync> myCommands;
+        DoubleCommandBuffer <InternalSync> myCommandBuffers;
     };
 
     class PresentScheduler :
+        public virtual CreationThreadAsserter,
         public virtual SchedulerBase
     {
-    protected:
-        PresentScheduler () :
-            myQueue (CoreDependent::get_device().getQueue(
-                CoreDependent::get_indices().families.present,
-                CoreDependent::get_indices().queues.present))
+    public:
+        explicit PresentScheduler (std::weak_ptr<Graphics::Core> const& core) :
+            CoreDependent (core),
+            myQueue (DeviceDependent::get_device().getQueue(
+                DeviceDependent::get_indices().families.present,
+                DeviceDependent::get_indices().queues.present))
         {}
 
-    public:
-        void present_image (vk::SwapchainKHR const swapchain,
-            uint32_t const image, uint32_t const frame)
+        PresentScheduler (PresentScheduler &&) = delete;
+        PresentScheduler (PresentScheduler const&) = delete;
+
+        PresentScheduler& operator=(PresentScheduler &&) = delete;
+        PresentScheduler& operator=(PresentScheduler const&) = delete;
+
+        void present_image (
+            vk::SwapchainKHR const swapchain,
+            uint32_t const image,
+            uint32_t const frame,
+            SyncTools& syncTools)
         {
+            CreationThreadAsserter::assert_creation_thread();
+            assert (syncTools.is_valid());
+
             std::array const waitSemaphores =
-                { SchedulerBase::get_render_completed_semaphore (frame) };
+                { syncTools.get_render_completed_semaphore (frame) };
 
             vk::PresentInfoKHR const presentInfo {
                 static_cast <uint32_t> (waitSemaphores.size()),
@@ -471,22 +290,6 @@ namespace Ignis::Detail
 
     private:
         vk::raii::Queue myQueue;
-    };
-
-    template <bool InternalSync>
-    class Scheduler :
-        public virtual CoreDependent,
-        public virtual GraphicsScheduler <InternalSync>,
-        public virtual TransferScheduler <InternalSync>,
-        public virtual PresentScheduler
-    {
-        using GraphicsScheduler = GraphicsScheduler <InternalSync>;
-        using TransferScheduler = TransferScheduler <InternalSync>;
-
-    protected:
-        explicit Scheduler (uint32_t const frames) :
-            GraphicsScheduler (frames)
-        {}
     };
 }
 

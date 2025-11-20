@@ -14,6 +14,8 @@
 #include <ignis/detail/debug_assert.hxx>
 
 #include <ignis/detail/core_dependent.hxx>
+#include <ignis/detail/swapchain.hxx>
+#include <ignis/detail/depth_manger.hxx>
 
 namespace Ignis::Detail
 {
@@ -31,6 +33,15 @@ namespace Ignis::Detail
 
 namespace Ignis::Graphics
 {
+    template <bool InternalSync>
+    class RenderPassFactory;
+
+    template <bool InternalSync>
+    class RenderPassBuilder;
+
+    template <bool InternalSync>
+    class SubpassBuilder;
+
     enum class DataFormat : std::underlying_type_t <vk::Format>
     {
         x_float  = static_cast <std::underlying_type_t <vk::Format>> (vk::Format::eR32Sfloat),
@@ -59,7 +70,7 @@ namespace Ignis::Graphics
 #endif
     };
 
-    enum class InputAttachmentFormat
+    enum class InputAttachment
     {
         color,
         depth,
@@ -105,17 +116,14 @@ namespace Ignis::Graphics
         vk::RenderPass myRenderPass;
     };
 
-    template <bool InternalSync> class RenderPassBuilder;
-    template <bool InternalSync> class SubpassBuilder;
-
     template <bool InternalSync>
     class RenderPassFactory final :
-        public Detail::CoreDependent
+        public Detail::DeviceDependent
     {
         [[nodiscard]] RenderPass
         make_render_pass (vk::RenderPassCreateInfo const& info)
         {
-            vk::raii::RenderPass renderPass { CoreDependent::get_device(), info };
+            vk::raii::RenderPass renderPass { DeviceDependent::get_device(), info };
 
             [[maybe_unused]] auto const lock =
                 Detail::lock_mutex <InternalSync, std::lock_guard> (myMutex);
@@ -128,12 +136,30 @@ namespace Ignis::Graphics
 
         friend class RenderPassBuilder <InternalSync>;
 
-    protected:
-        RenderPassFactory () noexcept = default;
+        explicit RenderPassFactory (std::shared_ptr <Detail::Swapchain>&& swapchain) noexcept :
+            CoreDependent (swapchain->get_core()),
+            mySwapchain (std::move (swapchain))
+        {}
+
+        explicit RenderPassFactory (
+            std::shared_ptr <Detail::Swapchain>&& swapchain,
+            std::shared_ptr <Detail::DepthManager <InternalSync>>&& depthManager)
+        :
+            CoreDependent (*swapchain, *depthManager),
+            mySwapchain (std::move (swapchain)),
+            myDepthManager (std::move (depthManager))
+        {}
 
     public:
-        explicit RenderPassFactory (std::weak_ptr <Core> const& core) :
-            CoreDependent (core)
+        explicit RenderPassFactory (std::weak_ptr <Detail::Swapchain> const& swapchain) :
+            RenderPassFactory (std::shared_ptr { swapchain })
+        {}
+
+        RenderPassFactory (
+            std::weak_ptr <Detail::Swapchain> const& swapchain,
+            std::weak_ptr <Detail::DepthManager <InternalSync>> const& depthManager)
+        :
+            RenderPassFactory (std::shared_ptr { swapchain }, std::shared_ptr { depthManager })
         {}
 
         RenderPassFactory (RenderPassFactory&&) = delete;
@@ -156,6 +182,9 @@ namespace Ignis::Graphics
         }
 
     private:
+        std::shared_ptr <Detail::Swapchain> mySwapchain;
+        std::shared_ptr <Detail::DepthManager <InternalSync>> myDepthManager;
+
         [[no_unique_address]] Detail::EnableMutex <InternalSync, std::mutex> myMutex;
 
         boost::unordered::unordered_flat_set
@@ -308,14 +337,6 @@ namespace Ignis::Graphics
             return iter->second;
         }
 
-        [[nodiscard]] vk::Format get_color_format () const noexcept {
-            return myColorFormat;
-        }
-
-        [[nodiscard]] vk::Format get_depth_format () const noexcept {
-            return myDepthFormat;
-        }
-
         void adopt_subpass (
             std::string&& name,
             Detail::SubpassInfo&& info,
@@ -359,7 +380,7 @@ namespace Ignis::Graphics
         {
             return vk::AttachmentDescription {
                 {},
-                myTopBuilder.get_color_format(),
+                myTopBuilder.myColorFormat,
                 samples,
                 vk::AttachmentLoadOp::eClear,
                 vk::AttachmentStoreOp::eStore,
@@ -375,7 +396,7 @@ namespace Ignis::Graphics
         {
             return vk::AttachmentDescription {
                 {},
-                myTopBuilder.get_depth_format(),
+                myTopBuilder.myDepthFormat,
                 samples,
                 vk::AttachmentLoadOp::eClear,
                 vk::AttachmentStoreOp::eStore,
@@ -407,7 +428,7 @@ namespace Ignis::Graphics
         {
             return vk::AttachmentDescription {
                 {},
-                myTopBuilder.get_color_format(),
+                myTopBuilder.myColorFormat,
                 vk::SampleCountFlagBits::e1,
                 vk::AttachmentLoadOp::eDontCare,
                 vk::AttachmentStoreOp::eStore,
@@ -553,8 +574,10 @@ namespace Ignis::Graphics
         [[nodiscard]] SubpassBuilder&
         depth_attachment (uint32_t const samples = 1)
         {
+            assert (myTopBuilder.myDepthFormat != vk::Format::eUndefined);
             assert (!myAttachmentsBaked);
             assert (!myInfo.depth.has_value());
+
             assert (std::has_single_bit (samples) && samples <= 64);
 
             auto const attachment = create_depth_attachment (static_cast <vk::SampleCountFlagBits> (samples));
@@ -583,13 +606,13 @@ namespace Ignis::Graphics
         }
 
         [[nodiscard]] SubpassBuilder&
-        input_attachment (InputAttachmentFormat const format)
+        input_attachment (InputAttachment const format)
         {
             assert (!myAttachmentsBaked);
             assert (Detail::is_enum_valid (format));
 
             auto const sourceFormat =
-                format == InputAttachmentFormat::color ?
+                format == InputAttachment::color ?
                 myTopBuilder.get_color_format () :
                 myTopBuilder.get_depth_format ();
 
@@ -657,14 +680,21 @@ namespace Ignis::Graphics
     RenderPassBuilder <InternalSync> RenderPassFactory <InternalSync>
     ::build_render_pass() noexcept
     {
-        return RenderPassBuilder <InternalSync> { *this, vk::Format::eB8G8R8A8Srgb, vk::Format::eD16Unorm };
+        auto const colorFormat = mySwapchain->get_format();
+        auto const depthFormat = myDepthManager ? myDepthManager->get_format() : vk::Format::eUndefined;
+
+        return RenderPassBuilder <InternalSync> {
+            *this,
+            colorFormat,
+            depthFormat
+        };
     }
 
     template <bool InternalSync>
     SubpassBuilder <InternalSync> RenderPassBuilder <InternalSync>
     ::begin_subpass (std::string_view const name)
     {
-        return SubpassBuilder { *this, mySubpassIndex, myBaseAttachmentIndex, std::string{ name }  };
+        return SubpassBuilder { *this, mySubpassIndex, myBaseAttachmentIndex, std::string { name }  };
     }
 }
 

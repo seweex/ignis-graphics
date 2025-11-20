@@ -19,6 +19,12 @@
 #include <ignis/detail/resource_memory.hxx>
 #include <ignis/detail/scheduler.hxx>
 
+namespace Ignis::Detail
+{
+    template <bool InternalSync>
+    class StagingBuffers;
+}
+
 namespace Ignis::Graphics
 {
     enum class BufferType
@@ -79,6 +85,9 @@ namespace Ignis::Graphics
         }
 
         template <bool InternalSync>
+        friend class Detail::StagingBuffers;
+
+        template <bool InternalSync>
         friend class BufferFactory;
 
         template <bool InternalSync>
@@ -106,12 +115,9 @@ namespace Ignis::Graphics
     };
 
     template <bool InternalSync>
-    class BufferFactory :
-        public virtual Detail::CoreDependent,
-        public virtual Detail::ResourceMemoryManager <InternalSync>
+    class BufferFactory final :
+        public Detail::DeviceDependent
     {
-        using ResourceMemoryManager = Detail::ResourceMemoryManager <InternalSync>;
-
         template <BufferType Type>
         [[nodiscard]] static consteval MemoryAccess get_memory_access () noexcept
         {
@@ -164,7 +170,7 @@ namespace Ignis::Graphics
             bool const transferWrite) const noexcept
         {
             boost::container::small_flat_set <uint32_t, 2> accessibleFamilies;
-            auto const coreFamilies = CoreDependent::get_indices().families;
+            auto const coreFamilies = DeviceDependent::get_indices().families;
 
             if constexpr (Usage == BufferUsage::storage)
                 accessibleFamilies.emplace (coreFamilies.transfer);
@@ -183,7 +189,7 @@ namespace Ignis::Graphics
             bool const allowTransferRead,
             bool const allowTransferWrite)
         {
-            auto const& device = CoreDependent::get_device();
+            auto const& device = DeviceDependent::get_device();
 
             auto const usage = get_usage_flags <Usage> (allowTransferRead, allowTransferWrite);
             auto const families = get_accessible_families <Usage> (allowTransferRead, allowTransferWrite);
@@ -200,13 +206,24 @@ namespace Ignis::Graphics
             return { device, createInfo };
         }
 
-    protected:
-        BufferFactory () noexcept = default;
+        explicit BufferFactory (std::shared_ptr <Detail::ResourceMemoryAllocator>&& allocator)
+        :
+            CoreDependent (allocator->get_core()),
+
+            myMemoryAllocator (std::move (allocator)),
+            myMemoryFactory (myMemoryAllocator->get_core())
+        {}
 
     public:
-        explicit BufferFactory (std::weak_ptr <Core> const& core) :
-            CoreDependent (core)
+        explicit BufferFactory (std::weak_ptr <Detail::ResourceMemoryAllocator> const& allocator) :
+            BufferFactory (std::shared_ptr { allocator })
         {}
+
+        BufferFactory (BufferFactory&&) = delete;
+        BufferFactory (BufferFactory const&) = delete;
+
+        BufferFactory& operator=(BufferFactory&&) = delete;
+        BufferFactory& operator=(BufferFactory const&) = delete;
 
         template <BufferType Type,
                   BufferUsage Usage,
@@ -230,9 +247,9 @@ namespace Ignis::Graphics
             auto constexpr memory_access = get_memory_access <Type> ();
 
             auto buffer = create_buffer <Usage> (size, allowTransferRead, allowTransferWrite);
-            auto memory = ResourceMemoryManager::template make_allocation <memory_access, Placement> (*buffer);
+            auto memory = myMemoryFactory->template make_allocation <memory_access, Placement> (*buffer);
 
-            ResourceMemoryManager::bind_to_resource(buffer, memory);
+            myMemoryManager.bind_to_resource (buffer, memory);
 
             [[maybe_unused]] auto const lock =
                 Detail::lock_mutex <InternalSync, std::lock_guard> (myMutex);
@@ -242,17 +259,25 @@ namespace Ignis::Graphics
         }
 
         template <BufferType Type, BufferUsage Usage>
-        void destroy_buffer (Buffer <Type, Usage> const buffer)
-        noexcept (!InternalSync)
+        void destroy_buffer (Buffer <Type, Usage> const buffer) noexcept (!InternalSync)
         {
             [[maybe_unused]] auto const lock =
                Detail::lock_mutex <InternalSync, std::lock_guard> (myMutex);
 
-            ResourceMemoryManager::destroy_allocation (buffer.myMemory);
+            myMemoryFactory->destroy_allocation (buffer.myMemory);
             myBuffers.erase (buffer.myBuffer);
         }
 
+        [[nodiscard]] std::weak_ptr <Detail::ResourceMemoryAllocator>
+        get_allocator () const noexcept {
+            return myMemoryAllocator;
+        }
+
     private:
+        std::shared_ptr <Detail::ResourceMemoryAllocator> myMemoryAllocator;
+        Detail::ResourceMemoryFactory <InternalSync> myMemoryFactory;
+        [[no_unique_address]] Detail::ResourceMemoryManager myMemoryManager;
+
         [[no_unique_address]] Detail::EnableMutex <InternalSync, std::mutex> myMutex;
 
         boost::unordered::unordered_flat_set
